@@ -16,14 +16,13 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v7
 
       - name: Check License Header
         uses: apache/skywalking-eyes/header@v0.8.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           config: .licenserc.yaml
           mode: check
+          token: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.token || '' }}
