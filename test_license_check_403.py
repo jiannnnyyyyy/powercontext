@@ -1,1 +1,0 @@
-print("license check test")
