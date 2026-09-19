@@ -1,15 +1,15 @@
 - Proposal Name: `memory_quality_and_lifecycle`
 - Start Date: 2026-09-18
+- Status: Proposed
+- RFC PR: [oceanbase/powercontext#1652](https://github.com/oceanbase/powercontext/pull/1652)
 - Tracking Issue: [oceanbase/powercontext#1590](https://github.com/oceanbase/powercontext/issues/1590)
 - Related RFCs: [RFC 0014](0014_memory_layer_design.md), [RFC 0019](0019_local_source_memory_runtime.md),
   [RFC 0028](0028_context_pack.md), [RFC 0050](0050_artifact_candidate_review_inbox.md),
   [RFC 0080](0080_memory_search_reranking.md), [RFC 1229](1229_unified_workloads_and_long_horizon_memory_evaluation.md),
-  and [RFC 1560](https://github.com/oceanbase/powercontext/blob/master/docs/en/rfcs/1560_recall_sufficiency_gate.md)
+  [RFC 1557](1557_recurring_failure_repair.md), and [RFC 1560](1560_recall_sufficiency_gate.md)
 - Related work: [#1425](https://github.com/oceanbase/powercontext/issues/1425),
   [#1321](https://github.com/oceanbase/powercontext/issues/1321),
-  [#1556](https://github.com/oceanbase/powercontext/issues/1556),
-  [#1586](https://github.com/oceanbase/powercontext/pull/1586), and
-  [#1596](https://github.com/oceanbase/powercontext/pull/1596)
+  and [#1556](https://github.com/oceanbase/powercontext/issues/1556)
 
 # Summary
 
@@ -326,11 +326,11 @@ membership_changed = false
 It is available whether or not reranking is enabled. It does not alter the public RRF `score`, add an HTTP field, or
 reuse a reranker trace whose absence when reranking is disabled would hide quality behavior.
 
-## Compatibility with recall sufficiency (#1556 / #1596)
+## Compatibility with recall sufficiency (RFC 1560)
 
-The disabled-by-default recall sufficiency gate in [RFC 1560](https://github.com/oceanbase/powercontext/blob/master/docs/en/rfcs/1560_recall_sufficiency_gate.md)
-and PR #1596 may issue additional bounded searches with a relaxed `AdmissionFloor`. That expansion is a new recall
-round, not a quality-driven pool-membership change.
+The disabled-by-default recall sufficiency gate in [RFC 1560](1560_recall_sufficiency_gate.md) may issue additional
+bounded searches with a relaxed `AdmissionFloor`. That expansion is a new recall round, not a quality-driven
+pool-membership change.
 
 For each issued round, this RFC applies validity filtering after that round’s channel admission and before baseline RRF.
 The gate accumulates and assesses baseline-order candidates; its Builder budget probe also uses baseline order. Quality
@@ -342,7 +342,10 @@ identities, and that every gate round remains governed by the RFC 1560 baseline 
 
 ## Near-duplicate alignment
 
-Near-duplicate alignment is a bounded write-side candidate procedure, not a destructive deduper:
+Near-duplicate alignment is a bounded write-side candidate procedure, not a destructive deduper. The authoritative
+`entry_content_hash` is not a text-only hash: it covers canonical kind, text, Source references, and Artifact
+references. A separate derived text fingerprint may find normalized textual equality, but it neither replaces the
+authoritative hash nor permits new evidence references to be discarded.
 
 ```text
 normalized content equality
@@ -351,9 +354,10 @@ normalized content equality
   -> relation/evidence-increment record or review proposal
 ```
 
-Exact normalized equality retains the existing no-op behavior. For semantic neighbors, thresholds such as
-`tau_same` and `tau_similar` are calibration inputs only. A semantic relation never automatically lowers importance to
-`low`, deactivates an entry, merges bodies, or assigns `superseded`.
+An exact authoritative-content match retains the existing no-op behavior. A text-fingerprint match with different
+evidence produces an evidence-increment relation or review proposal instead of a no-op. For semantic neighbors,
+thresholds such as `tau_same` and `tau_similar` are calibration inputs only. A semantic relation never automatically
+lowers importance to `low`, deactivates an entry, merges bodies, or assigns `superseded`.
 
 Deployments without embeddings may collect deterministic lexical evidence and create a review proposal, but must not
 automatically merge or discard paraphrases. Direct explicit writes and deterministic adapters may retain their existing
@@ -419,9 +423,9 @@ numbers, and dates. Repeated body “polishing” without new evidence is forbid
 
 L2 adds a Memory maintenance operation record with operation identity, approved proposal identity, affected entries,
 pre-state, created revisions/relations, derived-view effects, and declared compensation behavior. It must explicitly
-list effects that cannot be rolled back. This is distinct from L1 recovery and from PR #1586’s Experience-specific
+list effects that cannot be rolled back. This is distinct from L1 recovery and from RFC 1557’s Experience-specific
 recurrence ledger: Memory L2 must not reuse or overload that ledger, its event semantics, or its Experience review
-routing. Any Candidate/API extension for Memory is staged after #1586 and preserves existing Experience/Skill contracts.
+routing. Any Candidate/API extension for Memory preserves existing Experience/Skill contracts.
 
 ## Compression and physical retention boundary
 
@@ -450,7 +454,7 @@ manifest growth, and automatic-action categories, but they do not authorize dele
 - SQLite and OceanBase migrations/rebuilds must produce equivalent projection state and order.
 - #1321’s append-write amplification, storage layout, manifest splitting, and physical compaction remain outside this
   RFC; this RFC only supplies the Memory logical lifecycle and retrieval-quality boundary.
-- Lifecycle inventory must not silently add fields to the public `ScopeStats` contract introduced by #1586; any public
+- Lifecycle inventory must not silently add fields to the public `ScopeStats` contract introduced by RFC 1557; any public
   statistics API extension requires its own compatible contract update.
 
 ## Evaluation and calibration
@@ -485,10 +489,10 @@ acceptance thresholds.
 1. **Source prerequisite and neutral projection:** add the versioned Source evidence declaration, lifecycle projection
    rebuild, internal annotation shape, and conformance fixtures. Ranking remains disabled.
 2. **Stage-1 validity and fixed-pool ranking:** add current-state validity filtering, `MemoryRankingTrace`, and the
-   disabled-by-default `±2` reorder. Preserve #1596 recall-gate accounting and RFC 0080 reranker behavior.
+   disabled-by-default `±2` reorder. Preserve RFC 1560 recall-gate accounting and RFC 0080 reranker behavior.
 3. **Alignment and L1:** add bounded near-duplicate relationships/proposals, inventory, tiers, and dry-run L1.
 4. **L2 review:** separately stage Memory Candidate/review integration, operation records, consolidation, explicit
-   supersession, and promotion. Do not couple it to PR #1586’s Experience recurrence work.
+   supersession, and promotion. Do not couple it to RFC 1557’s Experience recurrence work.
 5. **Physical retention:** propose a separate RFC only if inventory and evaluation demonstrate a storage problem.
 
 ## Acceptance criteria for a future implementation
@@ -510,7 +514,7 @@ acceptance thresholds.
 - Quality ordering never changes channel admission, fixed RRF-pool membership, gate expansion policy, or public RRF score
   semantics. `MemoryRankingTrace` makes validity and membership invariance auditable.
 - The evaluation plan reports retrieval, task, safety, cost, and backend-parity results for SQLite and OceanBase, including the
-  joint #1556/#1596 recall-gate matrix.
+  joint #1556/RFC 1560 recall-gate matrix.
 
 # Drawbacks
 
