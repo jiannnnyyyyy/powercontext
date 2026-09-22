@@ -495,7 +495,9 @@ def capture_response(value: SourceReceipt) -> CaptureContentSourceResponse:
 
 def runtime_source_definition_manifest(value: SourceDefinitionManifest) -> RuntimeSourceDefinitionManifest:
     try:
-        return RuntimeSourceDefinitionManifest.model_validate(value.model_dump(mode="json", by_alias=True))
+        return RuntimeSourceDefinitionManifest.model_validate(
+            value.model_dump(mode="json", by_alias=True, exclude_none=True)
+        )
     except ValidationError as error:
         raise InvalidRuntimeRequestError("source-definition-manifest") from error
 
@@ -519,7 +521,9 @@ def submit_source_observation_request(value: SubmitSourceObservationRequest) -> 
     try:
         return RuntimeSubmitSourceObservation(
             scope_id=value.scope_id,
-            observation=RuntimeSourceObservation.model_validate(value.observation.model_dump(mode="json")),
+            observation=RuntimeSourceObservation.model_validate(
+                value.observation.model_dump(mode="json", exclude_none=True)
+            ),
         )
     except ValidationError as error:
         raise InvalidRuntimeRequestError("source-observation") from error

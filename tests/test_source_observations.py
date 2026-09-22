@@ -15,16 +15,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import urllib.request
+from dataclasses import replace
 
 import pytest
+import rfc8785
 from pydantic import ValidationError
 from referencing.exceptions import Unresolvable
 
-from powercontext.builtin.runtime.relational import _json_schema_validator
+from powercontext.builtin.runtime.relational import _json_schema_validator, _validate_source_observation
 from powercontext.builtin.sources import CONTENT_SOURCE_DEFINITION, ContentCapture
+from powercontext.http import SourceDefinitionManifest as HttpSourceDefinitionManifest
+from powercontext.http import SourceObservation as HttpSourceObservation
+from powercontext.http import SubmitSourceObservationRequest
+from powercontext.server.mapping import runtime_source_definition_manifest, submit_source_observation_request
 from powercontext.sources import (
     TEXT_EVIDENCE_PROJECTION_KEY,
+    MemoryEvidenceAuthority,
+    MemoryEvidenceDeclaration,
+    MemoryEvidenceVerification,
     Source,
     SourceCatalog,
     SourceDefinitionManifest,
@@ -52,6 +62,78 @@ def test_definition_manifest_has_a_stable_content_addressed_identity() -> None:
     assert first.fingerprint.startswith("sha256:")
     with pytest.raises(ValidationError, match="fingerprint does not match"):
         SourceDefinitionManifest.model_validate(first.model_dump(mode="json", by_alias=True) | {"version": "2"})
+
+
+def test_definition_manifest_carries_versioned_memory_evidence_to_remote_observations() -> None:
+    async def scenario() -> None:
+        definition = replace(
+            CONTENT_SOURCE_DEFINITION,
+            memory_evidence=MemoryEvidenceDeclaration(
+                authority=MemoryEvidenceAuthority.SYSTEM_ATTESTED,
+                verification=MemoryEvidenceVerification.VERIFIED,
+                declaration_version="attestation-v2",
+            ),
+        )
+        registry = SourceDefinitionRegistry((definition,))
+        manifest = manifest_for_definition(definition)
+        source = await registry.resolve(ContentCapture(source_id="turn-1", content="Keep this declaration."))
+        observation = project_source_for_transport(registry, source)
+
+        assert manifest.memory_evidence == definition.memory_evidence
+        assert source.memory_evidence == definition.memory_evidence
+        assert observation.memory_evidence == definition.memory_evidence
+        assert registry.memory_evidence(observation) == definition.memory_evidence
+        assert manifest.fingerprint != manifest_for_definition(CONTENT_SOURCE_DEFINITION).fingerprint
+
+        runtime = submit_source_observation_request(
+            SubmitSourceObservationRequest(
+                scope_id="scope",
+                observation=HttpSourceObservation.model_validate(observation.model_dump(mode="json")),
+            )
+        )
+        assert runtime.observation.memory_evidence == definition.memory_evidence
+        _validate_source_observation(runtime.observation, manifest)
+
+    asyncio.run(scenario())
+
+
+def test_legacy_remote_definition_manifest_remains_neutral_and_accepted() -> None:
+    current = manifest_for_definition(CONTENT_SOURCE_DEFINITION)
+    legacy_payload = {
+        "name": current.name,
+        "version": current.version,
+        "source_schema": current.source_schema,
+        "projections": [projection.model_dump(mode="json", by_alias=True) for projection in current.projections],
+    }
+    legacy = SourceDefinitionManifest(
+        name=current.name,
+        version=current.version,
+        source_schema=current.source_schema,
+        projections=current.projections,
+        fingerprint=f"sha256:{hashlib.sha256(rfc8785.dumps(legacy_payload)).hexdigest()}",
+    )
+    transported = HttpSourceDefinitionManifest.model_validate(
+        legacy.model_dump(mode="json", by_alias=True, exclude={"memory_evidence"})
+    )
+
+    assert runtime_source_definition_manifest(transported) == legacy
+    assert legacy.memory_evidence.authority == "untrusted"
+    assert legacy.memory_evidence.verification == "unknown"
+
+    async def legacy_source() -> SourceObservation:
+        registry = SourceDefinitionRegistry((CONTENT_SOURCE_DEFINITION,))
+        resolved = await registry.resolve(ContentCapture(source_id="turn-1", content="Legacy transport."))
+        return project_source_for_transport(registry, resolved)
+
+    source = asyncio.run(legacy_source()).model_copy(update={"definition_fingerprint": legacy.fingerprint})
+    legacy_observation = HttpSourceObservation.model_validate(
+        source.model_dump(mode="json", exclude={"memory_evidence"})
+    )
+    runtime_observation = submit_source_observation_request(
+        SubmitSourceObservationRequest(scope_id="scope", observation=legacy_observation)
+    ).observation
+    assert "memory_evidence" not in runtime_observation.__pydantic_fields_set__
+    _validate_source_observation(runtime_observation, legacy)
 
 
 def test_source_observation_remains_usable_without_worker_definition_code() -> None:
