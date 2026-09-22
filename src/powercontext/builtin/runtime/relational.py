@@ -231,6 +231,7 @@ from powercontext.limits import MAX_SOURCE_OBSERVATION_BYTES
 from powercontext.sources import (
     TEXT_EVIDENCE_PROJECTION_KEY,
     ConnectorBinding,
+    MemoryEvidenceDeclaration,
     Source,
     SourceCatalog,
     SourceDefinitionManifest,
@@ -1486,6 +1487,11 @@ class _RelationalMemorySourceResolver:
             raise SourceNotFoundError(ref) from None
         return stored.value
 
+    def memory_evidence(self, source: Source, /) -> MemoryEvidenceDeclaration:
+        """Resolve Definition-owned evidence metadata for a stored Source."""
+
+        return self._catalog.memory_evidence(source)
+
     async def get(self, source: Source, /) -> Source:
         try:
             async with self._database.connection(self._connection) as connection:
@@ -1987,6 +1993,8 @@ def _validate_source_observation(source: SourceObservation, manifest: SourceDefi
         raise InvalidSourceObservationError("definition", "does not match the registered manifest identity")
     if source.definition_fingerprint != manifest.fingerprint:
         raise InvalidSourceObservationError("fingerprint", "does not match the registered manifest")
+    if "memory_evidence" in source.__pydantic_fields_set__ and source.memory_evidence != manifest.memory_evidence:
+        raise InvalidSourceObservationError("memory_evidence", "does not match the registered manifest")
     if len(source.model_dump_json().encode()) > MAX_SOURCE_OBSERVATION_BYTES:
         raise InvalidSourceObservationError("size", "must not exceed 4 MiB")
     _validate_schema_value(manifest.name, manifest.source_schema, source.payload)

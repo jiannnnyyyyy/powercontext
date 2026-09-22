@@ -16,14 +16,17 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy import BigInteger, DateTime, Integer, String
+from sqlalchemy import BigInteger, DateTime, Integer, String, delete
 from sqlalchemy.dialects import mysql
 from sqlalchemy.schema import CreateTable, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 
 from powercontext.builtin.artifacts.memory import MemoryEntryInput
+from powercontext.builtin.persistence.memory import RelationalMemoryBackend
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.persistence.tables import (
+    MEMORY_ENTRY_EVIDENCE_TABLE,
     MEMORY_ENTRY_HEADS_TABLE,
+    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE,
     MEMORY_ENTRY_VERSIONS_TABLE,
 )
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
@@ -53,22 +56,31 @@ def _key_budget(constraint: PrimaryKeyConstraint | UniqueConstraint | ForeignKey
 def test_memory_schema_is_mysql_compilable_and_respects_key_and_payload_limits() -> None:
     dialect = mysql.dialect()
     versions = str(CreateTable(MEMORY_ENTRY_VERSIONS_TABLE).compile(dialect=dialect))
+    evidence = str(CreateTable(MEMORY_ENTRY_EVIDENCE_TABLE).compile(dialect=dialect))
     heads = str(CreateTable(MEMORY_ENTRY_HEADS_TABLE).compile(dialect=dialect))
+    lifecycle = str(CreateTable(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE).compile(dialect=dialect))
 
     assert "scope_id VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in versions
     assert "text MEDIUMTEXT NOT NULL" in versions
     assert "source_refs MEDIUMBLOB NOT NULL" in versions
     assert "artifact_refs MEDIUMBLOB NOT NULL" in versions
+    assert "declaration_version VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in evidence
     assert "searchable_text MEDIUMTEXT NOT NULL" in heads
+    assert "quality_policy VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in lifecycle
 
     budgets = [
         _key_budget(constraint)
-        for table in (MEMORY_ENTRY_VERSIONS_TABLE, MEMORY_ENTRY_HEADS_TABLE)
+        for table in (
+            MEMORY_ENTRY_VERSIONS_TABLE,
+            MEMORY_ENTRY_EVIDENCE_TABLE,
+            MEMORY_ENTRY_HEADS_TABLE,
+            MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE,
+        )
         for constraint in table.constraints
         if isinstance(constraint, PrimaryKeyConstraint | UniqueConstraint | ForeignKeyConstraint)
     ]
     assert budgets
-    assert max(budgets) == 2560
+    assert max(budgets) <= 2568
     assert all(budget < _INNODB_MAX_INDEX_BYTES for budget in budgets)
 
 
@@ -170,6 +182,59 @@ def test_sqlite_memory_backend_rebuilds_head_and_fts_projections() -> None:
             assert tuple(hit.text for hit in rebuilt.hits) == (
                 "Rebuild search projections from authoritative revisions.",
             )
+
+    asyncio.run(scenario())
+
+
+def test_memory_evidence_snapshots_and_neutral_lifecycle_projection_are_rebuildable() -> None:
+    async def scenario() -> None:
+        async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:
+            context = await contexts.get("project")
+            source, _ = await context.sources.capture(
+                ContentCapture(source_id="turn-1", content="A durable source declaration must be snapshotted.")
+            )
+            memory = await context.artifacts.memory.remember(
+                memory=None,
+                sources=(source,),
+                entries=(
+                    MemoryEntryInput(
+                        kind="decision",
+                        text="Keep provenance metadata outside the Memory body.",
+                        sources=(source,),
+                    ),
+                ),
+                mode="append",
+            )
+            assert memory is not None
+            (entry,) = await context.artifacts.memory.entries(memory)
+            assert entry.source_evidence[0].source.source_id == "turn-1"
+            assert entry.source_evidence[0].declaration.authority == "untrusted"
+            assert entry.source_evidence[0].declaration.verification == "unknown"
+
+            backend = RelationalMemoryBackend(
+                database=contexts.database,
+                scope_id="project",
+                artifacts=contexts.repositories.artifacts,
+                index=contexts.index,
+            )
+            current_lifecycle = (await backend.lifecycle_projections(memory.as_ref()))[0]
+            assert current_lifecycle.validity == "current"
+            assert current_lifecycle.context_annotation.time_state == "unknown"
+            assert current_lifecycle.context_annotation.quality_policy == "neutral"
+
+            inactive = await context.artifacts.memory.forget(memory, entries=(entry,), reason="superseded elsewhere")
+            assert inactive is not None
+            lifecycle = await backend.lifecycle_projections(inactive.as_ref())
+            assert lifecycle[0].validity == "inactive"
+            assert lifecycle[0].source_evidence == entry.source_evidence
+
+            async with contexts.database.transaction() as connection:
+                await connection.execute(delete(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE))
+
+            await context.artifacts.memory.rebuild_projections()
+
+            rebuilt = await backend.lifecycle_projections(inactive.as_ref())
+            assert rebuilt == lifecycle
 
     asyncio.run(scenario())
 

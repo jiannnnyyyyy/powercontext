@@ -29,7 +29,7 @@ from powercontext.errors import (
 )
 from powercontext.limits import MAX_SOURCE_TYPE_LENGTH
 from powercontext.sources.definitions import SourceDefinition, SourceDefinitionRegistry
-from powercontext.sources.models import Source, SourceMaterialization, SourceProjectionKey
+from powercontext.sources.models import MemoryEvidenceDeclaration, Source, SourceMaterialization, SourceProjectionKey
 
 _JSON_VALUE = TypeAdapter(JsonValue)
 
@@ -59,6 +59,7 @@ class SourceDefinitionManifest(BaseModel):
     fingerprint: str
     source_schema: dict[str, JsonValue]
     projections: tuple[SourceProjectionManifest, ...] = ()
+    memory_evidence: MemoryEvidenceDeclaration = MemoryEvidenceDeclaration()
 
     @field_validator("name", "version")
     @classmethod
@@ -106,6 +107,10 @@ class SourceDefinitionManifest(BaseModel):
             version=self.version,
             source_schema=self.source_schema,
             projections=self.projections,
+            # Accept persisted and remote manifests emitted before the evidence
+            # declaration existed. They resolve to the neutral declaration, but
+            # retain their historical content-addressed identity.
+            memory_evidence=self.memory_evidence if "memory_evidence" in self.__pydantic_fields_set__ else None,
         )
         if self.fingerprint != expected:
             raise ValueError("manifest fingerprint does not match its declaration")  # noqa: TRY003
@@ -179,9 +184,11 @@ def manifest_for_definition(definition: SourceDefinition[Any, Any, Any], /) -> S
             version=definition.version,
             source_schema=source_schema,
             projections=projections,
+            memory_evidence=definition.memory_evidence,
         ),
         source_schema=source_schema,
         projections=projections,
+        memory_evidence=definition.memory_evidence,
     )
 
 
@@ -210,6 +217,7 @@ def project_source_for_transport(
         description=source.description,
         source_type=definition.name,
         definition_fingerprint=manifest.fingerprint,
+        memory_evidence=manifest.memory_evidence,
         payload=payload,
         projections=projections,
     )
@@ -221,12 +229,14 @@ def _source_definition_fingerprint(
     version: str,
     source_schema: dict[str, JsonValue],
     projections: tuple[SourceProjectionManifest, ...],
+    memory_evidence: MemoryEvidenceDeclaration | None,
 ) -> str:
     declaration = {
         "name": name,
         "version": version,
         "source_schema": source_schema,
         "projections": [projection.model_dump(mode="json", by_alias=True) for projection in projections],
+        **({} if memory_evidence is None else {"memory_evidence": memory_evidence.model_dump(mode="json")}),
     }
     encoded = rfc8785.dumps(_JSON_VALUE.validate_python(declaration))
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
