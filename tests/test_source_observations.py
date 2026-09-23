@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import urllib.request
 from dataclasses import replace
 
@@ -52,6 +53,24 @@ class EmptySourceBackend:
 
     async def get(self, source: Source, /) -> Source:
         raise AssertionError(source)
+
+
+def _legacy_manifest(current: SourceDefinitionManifest) -> SourceDefinitionManifest:
+    """Return the declaration shape emitted before the evidence field existed."""
+
+    payload = {
+        "name": current.name,
+        "version": current.version,
+        "source_schema": current.source_schema,
+        "projections": [projection.model_dump(mode="json", by_alias=True) for projection in current.projections],
+    }
+    return SourceDefinitionManifest(
+        name=current.name,
+        version=current.version,
+        source_schema=current.source_schema,
+        projections=current.projections,
+        fingerprint=f"sha256:{hashlib.sha256(rfc8785.dumps(payload)).hexdigest()}",
+    )
 
 
 def test_definition_manifest_has_a_stable_content_addressed_identity() -> None:
@@ -99,19 +118,7 @@ def test_definition_manifest_carries_versioned_memory_evidence_to_remote_observa
 
 def test_legacy_remote_definition_manifest_remains_neutral_and_accepted() -> None:
     current = manifest_for_definition(CONTENT_SOURCE_DEFINITION)
-    legacy_payload = {
-        "name": current.name,
-        "version": current.version,
-        "source_schema": current.source_schema,
-        "projections": [projection.model_dump(mode="json", by_alias=True) for projection in current.projections],
-    }
-    legacy = SourceDefinitionManifest(
-        name=current.name,
-        version=current.version,
-        source_schema=current.source_schema,
-        projections=current.projections,
-        fingerprint=f"sha256:{hashlib.sha256(rfc8785.dumps(legacy_payload)).hexdigest()}",
-    )
+    legacy = _legacy_manifest(current)
     transported = HttpSourceDefinitionManifest.model_validate(
         legacy.model_dump(mode="json", by_alias=True, exclude={"memory_evidence"})
     )
@@ -134,6 +141,20 @@ def test_legacy_remote_definition_manifest_remains_neutral_and_accepted() -> Non
     ).observation
     assert "memory_evidence" not in runtime_observation.__pydantic_fields_set__
     _validate_source_observation(runtime_observation, legacy)
+
+
+def test_legacy_definition_manifest_round_trips_without_gaining_the_evidence_field() -> None:
+    current = manifest_for_definition(CONTENT_SOURCE_DEFINITION)
+    legacy = _legacy_manifest(current)
+
+    stored = SourceDefinitionManifest.model_validate_json(legacy.model_dump_json(by_alias=True))
+    transported = HttpSourceDefinitionManifest.model_validate(legacy.model_dump(mode="json", by_alias=True))
+
+    assert stored == legacy
+    assert transported.memory_evidence is None
+    assert "memory_evidence" not in json.loads(legacy.model_dump_json(by_alias=True))
+    assert SourceDefinitionManifest.model_validate_json(current.model_dump_json(by_alias=True)) == current
+    assert "memory_evidence" in current.model_dump(mode="json", by_alias=True)
 
 
 def test_source_observation_remains_usable_without_worker_definition_code() -> None:

@@ -20,7 +20,17 @@ import hashlib
 from typing import Any, Literal
 
 import rfc8785
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    TypeAdapter,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from powercontext.errors import (
     InvalidSourceDefinitionError,
@@ -115,6 +125,21 @@ class SourceDefinitionManifest(BaseModel):
         if self.fingerprint != expected:
             raise ValueError("manifest fingerprint does not match its declaration")  # noqa: TRY003
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_manifest(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Preserve the field set the fingerprint actually covers.
+
+        A manifest received without a declaration keeps its historical identity, so
+        it must also serialize without that field. Writing the model default would
+        make the stored payload validate against a different fingerprint than the
+        one it was registered with, which makes registration unreadable.
+        """
+
+        dumped = handler(self)
+        if "memory_evidence" not in self.__pydantic_fields_set__:
+            dumped.pop("memory_evidence", None)
+        return dumped
 
 
 class SourceProjectionValue(BaseModel):
