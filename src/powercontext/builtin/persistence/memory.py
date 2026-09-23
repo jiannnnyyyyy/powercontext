@@ -211,7 +211,12 @@ class RelationalMemoryBackend:
         return tuple(by_id[version_id] for version_id in version_ids)
 
     async def lifecycle_projections(self, memory: ArtifactRef, /) -> tuple[MemoryLifecycleProjection, ...]:
-        """Load the internal neutral lifecycle projection for one exact Memory head."""
+        """Load the internal neutral lifecycle projection for one exact Memory head.
+
+        Rows are keyed by entry and re-stamped only by the revision that changes
+        them, so the read selects the artifact's rows and proves completeness by
+        entry identity, exactly as the active-head projection does.
+        """
 
         canonical = await self.get(memory)
         version_ids = tuple(item.entry_version_id for item in canonical.content.manifest.entries)
@@ -235,7 +240,6 @@ class RelationalMemoryBackend:
                     .where(
                         MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.scope_id == self._scope_id,
                         MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.memory_artifact_id == memory.artifact_id,
-                        MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.head_revision == memory.revision,
                     )
                     .order_by(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.entry_id)
                 )
@@ -480,7 +484,22 @@ class RelationalMemoryBackend:
         connection: AsyncConnection,
         memory: Memory,
     ) -> tuple[MemoryLifecycleProjection, ...]:
-        manifest = memory.content.manifest.entries
+        return await self._lifecycle_for_entries(
+            connection,
+            memory,
+            tuple(item.entry_id for item in memory.content.manifest.entries),
+        )
+
+    async def _lifecycle_for_entries(
+        self,
+        connection: AsyncConnection,
+        memory: Memory,
+        entry_ids: tuple[str, ...],
+    ) -> tuple[MemoryLifecycleProjection, ...]:
+        """Derive lifecycle rows for the named manifest entries of one Memory."""
+
+        wanted = frozenset(entry_ids)
+        manifest = tuple(item for item in memory.content.manifest.entries if item.entry_id in wanted)
         if not manifest:
             return ()
         version_ids = tuple(item.entry_version_id for item in manifest)
@@ -692,16 +711,37 @@ class RelationalMemoryBackend:
                 value.memory.as_ref(),
                 upserts,
             )
-        # Lifecycle rows are keyed by entry, not by revision, so the artifact's rows
-        # are replaced wholesale: lifecycle_projections reads them back by revision.
-        await connection.execute(
-            delete(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE).where(
-                MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.scope_id == self._scope_id,
-                MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.memory_artifact_id == value.memory.artifact_id,
+        # Lifecycle rows cover every manifest entry, including inactive ones, and
+        # follow the same per-entry rule as the active head: only the entries whose
+        # identity or state changed are rewritten, so repeated appends stay bounded
+        # by the appended entries instead of the manifest size.
+        previous_entries = (
+            {}
+            if value.base is None
+            else {item.entry_id: (item.entry_version_id, item.state) for item in value.base.content.manifest.entries}
+        )
+        current_entries = {
+            item.entry_id: (item.entry_version_id, item.state) for item in value.memory.content.manifest.entries
+        }
+        lifecycle_removed = tuple(sorted(entry_id for entry_id in previous_entries if entry_id not in current_entries))
+        lifecycle_changed = tuple(
+            sorted(
+                entry_id for entry_id, identity in current_entries.items() if previous_entries.get(entry_id) != identity
             )
         )
-        lifecycle = await self._lifecycle_for_memory(connection, committed)
-        if lifecycle:
+        lifecycle_drop = tuple(sorted({*lifecycle_removed, *lifecycle_changed}))
+        if lifecycle_drop:
+            await connection.execute(
+                delete(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE).where(
+                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.scope_id == self._scope_id,
+                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.memory_artifact_id == value.memory.artifact_id,
+                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.entry_id.in_(lifecycle_drop),
+                )
+            )
+        if lifecycle_changed:
+            lifecycle = await self._lifecycle_for_entries(connection, committed, lifecycle_changed)
+            if len(lifecycle) != len(lifecycle_changed):
+                raise _InvalidMemoryCommitError("lifecycle-projection")
             await connection.execute(
                 insert(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE),
                 [_lifecycle_values(self._scope_id, projection) for projection in lifecycle],

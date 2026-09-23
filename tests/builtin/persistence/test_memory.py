@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy import BigInteger, DateTime, Integer, String, delete
+from sqlalchemy import BigInteger, DateTime, Integer, String, delete, select
 from sqlalchemy.dialects import mysql
 from sqlalchemy.schema import CreateTable, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 
@@ -30,6 +30,7 @@ from powercontext.builtin.persistence.tables import (
     MEMORY_ENTRY_VERSIONS_TABLE,
 )
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
+from powercontext.builtin.runtime.relational import RelationalContexts
 from powercontext.builtin.sources import ContentCapture, ContentSource
 
 _INNODB_MAX_INDEX_BYTES = 3072
@@ -235,6 +236,93 @@ def test_memory_evidence_snapshots_and_neutral_lifecycle_projection_are_rebuilda
 
             rebuilt = await backend.lifecycle_projections(inactive.as_ref())
             assert rebuilt == lifecycle
+
+    asyncio.run(scenario())
+
+
+async def _lifecycle_rows(contexts: RelationalContexts) -> dict[str, tuple[int, str]]:
+    async with contexts.database.transaction() as connection:
+        rows = (
+            await connection.execute(
+                select(
+                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.entry_id,
+                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.head_revision,
+                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.validity,
+                )
+            )
+        ).all()
+    return {str(entry_id): (int(revision), str(validity)) for entry_id, revision, validity in rows}
+
+
+def test_lifecycle_projection_rows_are_rewritten_only_for_changed_entries() -> None:
+    async def scenario() -> None:
+        async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:
+            context = await contexts.get("project")
+            source, _ = await context.sources.capture(
+                ContentCapture(source_id="turn-1", content="Lifecycle rows must follow their own entry.")
+            )
+            opened = await context.artifacts.memory.remember(
+                memory=None,
+                sources=(source,),
+                entries=(
+                    MemoryEntryInput(kind="decision", text="Keep the first entry.", sources=(source,)),
+                    MemoryEntryInput(kind="constraint", text="Keep the second entry.", sources=(source,)),
+                ),
+                mode="append",
+            )
+            assert opened is not None
+            opened_rows = await _lifecycle_rows(contexts)
+            assert len(opened_rows) == 2
+            assert {revision for revision, _ in opened_rows.values()} == {opened.revision}
+
+            appended = await context.artifacts.memory.remember(
+                memory=opened,
+                sources=(source,),
+                entries=(MemoryEntryInput(kind="agent-note", text="Append exactly one entry.", sources=(source,)),),
+                mode="append",
+            )
+            assert appended is not None
+            assert appended.revision == opened.revision + 1
+
+            backend = RelationalMemoryBackend(
+                database=contexts.database,
+                scope_id="project",
+                artifacts=contexts.repositories.artifacts,
+                index=contexts.index,
+            )
+            appended_rows = await _lifecycle_rows(contexts)
+
+            # Appending one entry rewrites that entry alone: every row that was
+            # already current keeps the revision that last wrote it.
+            assert len(appended_rows) == 3
+            assert {
+                entry_id: value for entry_id, value in appended_rows.items() if entry_id in opened_rows
+            } == opened_rows
+            assert {validity for _, validity in appended_rows.values()} == {"current"}
+
+            forgotten = (await context.artifacts.memory.entries(opened))[0]
+            inactive = await context.artifacts.memory.forget(
+                appended,
+                entries=(forgotten,),
+                reason="superseded elsewhere",
+            )
+            assert inactive is not None
+            inactive_rows = await _lifecycle_rows(contexts)
+
+            assert inactive_rows[forgotten.entry_id] == (inactive.revision, "inactive")
+            assert {entry_id: value for entry_id, value in inactive_rows.items() if entry_id != forgotten.entry_id} == {
+                entry_id: value for entry_id, value in appended_rows.items() if entry_id != forgotten.entry_id
+            }
+
+            incremental = await backend.lifecycle_projections(inactive.as_ref())
+            assert {item.validity for item in incremental if item.entry_id == forgotten.entry_id} == {"inactive"}
+            assert {item.validity for item in incremental if item.entry_id != forgotten.entry_id} == {"current"}
+
+            async with contexts.database.transaction() as connection:
+                await connection.execute(delete(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE))
+            await context.artifacts.memory.rebuild_projections()
+
+            assert await backend.lifecycle_projections(inactive.as_ref()) == incremental
 
     asyncio.run(scenario())
 

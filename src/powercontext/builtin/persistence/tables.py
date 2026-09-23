@@ -1051,6 +1051,10 @@ MEMORY_ENTRY_HEADS_TABLE = Table(
     CheckConstraint("head_revision > 0", name="ck_pc_memory_entry_heads_revision_positive"),
 )
 
+# Lifecycle rows are maintained per entry and re-stamped only by the revision that
+# changes them, like the active-head and vector rows. ``head_revision`` records the
+# revision that last wrote a row; a read identifies rows by entry and proves
+# completeness against the authoritative manifest rather than by revision.
 MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE = Table(
     "pc_memory_entry_lifecycle_projections",
     SHARED_METADATA,
