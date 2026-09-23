@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy import BigInteger, DateTime, Integer, String, delete, select
+from sqlalchemy import BigInteger, DateTime, Integer, String, delete, event, select
 from sqlalchemy.dialects import mysql
 from sqlalchemy.schema import CreateTable, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 
 from powercontext.builtin.artifacts.memory import MemoryEntryInput
+from powercontext.builtin.persistence.database import SELECTION_BATCH_SIZE
 from powercontext.builtin.persistence.memory import RelationalMemoryBackend
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.persistence.tables import (
@@ -34,6 +35,7 @@ from powercontext.builtin.runtime.relational import RelationalContexts
 from powercontext.builtin.sources import ContentCapture, ContentSource
 
 _INNODB_MAX_INDEX_BYTES = 3072
+_EVIDENCE_BUDGET_ENTRIES = SELECTION_BATCH_SIZE
 
 
 class _UnbudgetedColumnTypeError(TypeError):
@@ -323,6 +325,60 @@ def test_lifecycle_projection_rows_are_rewritten_only_for_changed_entries() -> N
             await context.artifacts.memory.rebuild_projections()
 
             assert await backend.lifecycle_projections(inactive.as_ref()) == incremental
+
+    asyncio.run(scenario())
+
+
+def test_manifest_evidence_lookups_stay_within_the_shared_bind_budget() -> None:
+    """A manifest read must batch evidence lookups instead of binding every entry.
+
+    The ceiling that matters depends on the SQLite build (32,766 on most system
+    builds, 250,000 in CPython's bundled Windows library), so this pins the bind
+    budget the backend controls rather than one build's variable limit.
+    """
+
+    async def scenario() -> None:
+        async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:
+            context = await contexts.get("project")
+            bound: list[int] = []
+
+            def record_statement(
+                _connection: object,
+                _cursor: object,
+                statement: str,
+                parameters: object,
+                *_rest: object,
+            ) -> None:
+                if not statement.lstrip().upper().startswith("SELECT"):
+                    return
+                if "pc_memory_entry_evidence" in statement:
+                    assert isinstance(parameters, tuple | list)
+                    bound.append(len(parameters))
+
+            engine = contexts.database.engine.sync_engine
+            event.listen(engine, "before_cursor_execute", record_statement)
+            try:
+                opened = await context.artifacts.memory.remember(
+                    memory=None,
+                    entries=tuple(
+                        MemoryEntryInput(kind="agent-note", text=f"Bounded entry {index}.", sources=())
+                        for index in range(_EVIDENCE_BUDGET_ENTRIES)
+                    ),
+                    mode="append",
+                )
+                assert opened is not None
+                appended = await context.artifacts.memory.remember(
+                    memory=opened,
+                    entries=(MemoryEntryInput(kind="agent-note", text="Appended within budget.", sources=()),),
+                    mode="append",
+                )
+                assert appended is not None
+                assert len(await context.artifacts.memory.entries(appended)) == _EVIDENCE_BUDGET_ENTRIES + 1
+            finally:
+                event.remove(engine, "before_cursor_execute", record_statement)
+
+            assert bound
+            assert max(bound) <= SELECTION_BATCH_SIZE
 
     asyncio.run(scenario())
 

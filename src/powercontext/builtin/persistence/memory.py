@@ -58,7 +58,7 @@ from powercontext.builtin.artifacts.search import analyze_text
 from powercontext.builtin.inference import EmbeddingModel
 from powercontext.builtin.persistence.artifacts import ArtifactRepository
 from powercontext.builtin.persistence.codec import dump_model, load_model, stored_bytes
-from powercontext.builtin.persistence.database import AsyncDatabase
+from powercontext.builtin.persistence.database import SELECTION_BATCH_SIZE, AsyncDatabase
 from powercontext.builtin.persistence.errors import RepositoryNotFoundError
 from powercontext.builtin.persistence.memory_index import MemoryIndex, NoMemoryIndex
 from powercontext.builtin.persistence.tables import (
@@ -85,6 +85,11 @@ class _SourceRefs(RootModel[tuple[SourceRef, ...]]):
 
 class _ArtifactRefs(RootModel[tuple[ArtifactRef, ...]]):
     pass
+
+
+# An evidence lookup binds three identity columns per entry plus the scope, so it
+# chunks at the shared bind budget instead of the shared selection row count.
+_EVIDENCE_SELECTION_BATCH_SIZE = max(1, SELECTION_BATCH_SIZE // 3)
 
 
 class _MemoryDraft(ArtifactDraft[MemoryContent]):
@@ -435,39 +440,43 @@ class RelationalMemoryBackend:
     ) -> tuple[MemoryEntryVersion, ...]:
         if not entries:
             return ()
-        identities = tuple((entry.memory_artifact_id, entry.entry_id, entry.entry_version_id) for entry in entries)
-        rows = (
-            await connection.execute(
-                select(MEMORY_ENTRY_EVIDENCE_TABLE)
-                .where(
-                    MEMORY_ENTRY_EVIDENCE_TABLE.c.scope_id == self._scope_id,
-                    tuple_(
+        identities = tuple(
+            dict.fromkeys((entry.memory_artifact_id, entry.entry_id, entry.entry_version_id) for entry in entries)
+        )
+        snapshots: dict[tuple[str, str, str], list[MemoryEvidenceSnapshot]] = {}
+        for start in range(0, len(identities), _EVIDENCE_SELECTION_BATCH_SIZE):
+            batch = identities[start : start + _EVIDENCE_SELECTION_BATCH_SIZE]
+            rows = (
+                await connection.execute(
+                    select(MEMORY_ENTRY_EVIDENCE_TABLE)
+                    .where(
+                        MEMORY_ENTRY_EVIDENCE_TABLE.c.scope_id == self._scope_id,
+                        tuple_(
+                            MEMORY_ENTRY_EVIDENCE_TABLE.c.memory_artifact_id,
+                            MEMORY_ENTRY_EVIDENCE_TABLE.c.entry_id,
+                            MEMORY_ENTRY_EVIDENCE_TABLE.c.entry_version_id,
+                        ).in_(batch),
+                    )
+                    .order_by(
                         MEMORY_ENTRY_EVIDENCE_TABLE.c.memory_artifact_id,
                         MEMORY_ENTRY_EVIDENCE_TABLE.c.entry_id,
                         MEMORY_ENTRY_EVIDENCE_TABLE.c.entry_version_id,
-                    ).in_(identities),
+                        MEMORY_ENTRY_EVIDENCE_TABLE.c.ordinal,
+                    )
                 )
-                .order_by(
-                    MEMORY_ENTRY_EVIDENCE_TABLE.c.memory_artifact_id,
-                    MEMORY_ENTRY_EVIDENCE_TABLE.c.entry_id,
-                    MEMORY_ENTRY_EVIDENCE_TABLE.c.entry_version_id,
-                    MEMORY_ENTRY_EVIDENCE_TABLE.c.ordinal,
+            ).mappings()
+            for row in rows:
+                identity = (str(row["memory_artifact_id"]), str(row["entry_id"]), str(row["entry_version_id"]))
+                snapshots.setdefault(identity, []).append(
+                    MemoryEvidenceSnapshot(
+                        source=SourceRef(source_type=str(row["source_type"]), source_id=str(row["source_id"])),
+                        declaration=MemoryEvidenceDeclaration(
+                            authority=MemoryEvidenceAuthority(str(row["authority"])),
+                            verification=MemoryEvidenceVerification(str(row["verification"])),
+                            declaration_version=str(row["declaration_version"]),
+                        ),
+                    )
                 )
-            )
-        ).mappings()
-        snapshots: dict[tuple[str, str, str], list[MemoryEvidenceSnapshot]] = {}
-        for row in rows:
-            identity = (str(row["memory_artifact_id"]), str(row["entry_id"]), str(row["entry_version_id"]))
-            snapshots.setdefault(identity, []).append(
-                MemoryEvidenceSnapshot(
-                    source=SourceRef(source_type=str(row["source_type"]), source_id=str(row["source_id"])),
-                    declaration=MemoryEvidenceDeclaration(
-                        authority=MemoryEvidenceAuthority(str(row["authority"])),
-                        verification=MemoryEvidenceVerification(str(row["verification"])),
-                        declaration_version=str(row["declaration_version"]),
-                    ),
-                )
-            )
         hydrated: list[MemoryEntryVersion] = []
         for entry in entries:
             identity = (entry.memory_artifact_id, entry.entry_id, entry.entry_version_id)
