@@ -157,6 +157,32 @@ def test_legacy_definition_manifest_round_trips_without_gaining_the_evidence_fie
     assert "memory_evidence" in current.model_dump(mode="json", by_alias=True)
 
 
+def test_source_observation_request_mapping_preserves_null_projection_values() -> None:
+    async def scenario() -> None:
+        registry = SourceDefinitionRegistry((CONTENT_SOURCE_DEFINITION,))
+        resolved = await registry.resolve(ContentCapture(source_id="turn-1", content="Null is a value."))
+        projected = project_source_for_transport(registry, resolved)
+        (projection,) = projected.projections
+        transport = HttpSourceObservation.model_validate(
+            projected.model_dump(mode="json", exclude={"memory_evidence"})
+            | {
+                "payload": projected.payload | {"nullable_field": None},
+                "projections": [{"key": projection.key.model_dump(mode="json"), "value": None}],
+            }
+        )
+
+        observation = submit_source_observation_request(
+            SubmitSourceObservationRequest(scope_id="scope", observation=transport)
+        ).observation
+
+        assert observation.projections[0].value is None
+        assert observation.payload == transport.payload
+        assert observation.payload["nullable_field"] is None
+        assert "memory_evidence" not in observation.__pydantic_fields_set__
+
+    asyncio.run(scenario())
+
+
 def test_source_observation_remains_usable_without_worker_definition_code() -> None:
     async def scenario() -> None:
         registry = SourceDefinitionRegistry((CONTENT_SOURCE_DEFINITION,))
