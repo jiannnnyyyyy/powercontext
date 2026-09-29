@@ -1055,6 +1055,12 @@ MEMORY_ENTRY_HEADS_TABLE = Table(
 # changes them, like the active-head and vector rows. ``head_revision`` records the
 # revision that last wrote a row; a read identifies rows by entry and proves
 # completeness against the authoritative manifest rather than by revision.
+#
+# The CHECK constraints below describe the stage-1 vocabulary, which is why
+# ``quality_policy`` admits only ``neutral``. Stage 2 has to widen them in one DDL
+# migration alongside the model literals; the columns are narrow enough that an
+# allow-list is the right shape, so the migration is a constraint swap rather than
+# a rebuild.
 MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE = Table(
     "pc_memory_entry_lifecycle_projections",
     SHARED_METADATA,

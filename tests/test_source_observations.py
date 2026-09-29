@@ -19,6 +19,7 @@ import hashlib
 import json
 import urllib.request
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 import rfc8785
@@ -26,7 +27,7 @@ from pydantic import ValidationError
 from referencing.exceptions import Unresolvable
 
 from powercontext.builtin.runtime.relational import _json_schema_validator, _validate_source_observation
-from powercontext.builtin.sources import CONTENT_SOURCE_DEFINITION, ContentCapture
+from powercontext.builtin.sources import CONTENT_SOURCE_DEFINITION, ContentCapture, ContentSource
 from powercontext.http import SourceDefinitionManifest as HttpSourceDefinitionManifest
 from powercontext.http import SourceObservation as HttpSourceObservation
 from powercontext.http import SubmitSourceObservationRequest
@@ -38,10 +39,13 @@ from powercontext.sources import (
     MemoryEvidenceVerification,
     Source,
     SourceCatalog,
+    SourceDefinition,
     SourceDefinitionManifest,
     SourceDefinitionRegistry,
+    SourceMaterialization,
     SourceObservation,
     TextEvidence,
+    definition_memory_evidence,
     manifest_for_definition,
     project_source_for_transport,
 )
@@ -71,6 +75,43 @@ def _legacy_manifest(current: SourceDefinitionManifest) -> SourceDefinitionManif
         projections=current.projections,
         fingerprint=f"sha256:{hashlib.sha256(rfc8785.dumps(payload)).hexdigest()}",
     )
+
+
+def test_definition_without_a_declaration_attribute_still_registers() -> None:
+    """An adapter written before the declaration existed must keep registering.
+
+    The attribute is part of the Definition contract now, but an out-of-tree
+    adapter built directly on the protocol does not carry it. Resolving that to the
+    neutral declaration keeps such an adapter usable instead of failing its
+    registration.
+    """
+
+    class LegacyDefinition:
+        name = "legacy"
+        version = "1"
+        projections: tuple[object, ...] = ()
+        input_class = ContentCapture
+        source_class = ContentSource
+
+        async def resolve(self, value: ContentCapture, /) -> ContentSource:
+            return ContentSource(
+                name=value.source_id,
+                materialization=SourceMaterialization.CAPTURED,
+                content=value.content,
+            )
+
+        async def read(self, source: ContentSource, /) -> str:
+            return source.content
+
+    definition = LegacyDefinition()
+    # Deliberately outside the current protocol: the attribute does not exist yet,
+    # which is what the runtime has to tolerate.
+    manifest = manifest_for_definition(cast(SourceDefinition[Any, Any, Any], definition))
+
+    assert definition_memory_evidence(definition) == MemoryEvidenceDeclaration()
+    assert manifest.memory_evidence == MemoryEvidenceDeclaration()
+    # A neutral declaration keeps the manifest at its pre-declaration identity.
+    assert manifest.fingerprint == _legacy_manifest(manifest).fingerprint
 
 
 def test_definition_manifest_has_a_stable_content_addressed_identity() -> None:
@@ -154,7 +195,20 @@ def test_legacy_definition_manifest_round_trips_without_gaining_the_evidence_fie
     assert transported.memory_evidence is None
     assert "memory_evidence" not in json.loads(legacy.model_dump_json(by_alias=True))
     assert SourceDefinitionManifest.model_validate_json(current.model_dump_json(by_alias=True)) == current
-    assert "memory_evidence" in current.model_dump(mode="json", by_alias=True)
+
+    # A neutral declaration carries no ranking preference, so it does not change
+    # the manifest a Definition emits and can be omitted from the transport.
+    assert current == legacy
+    assert "memory_evidence" not in current.model_dump(mode="json", by_alias=True)
+
+    declared = manifest_for_definition(
+        replace(
+            CONTENT_SOURCE_DEFINITION,
+            memory_evidence=MemoryEvidenceDeclaration(authority=MemoryEvidenceAuthority.SYSTEM_ATTESTED),
+        )
+    )
+    assert declared != current
+    assert "memory_evidence" in declared.model_dump(mode="json", by_alias=True)
 
 
 def test_source_observation_request_mapping_preserves_null_projection_values() -> None:

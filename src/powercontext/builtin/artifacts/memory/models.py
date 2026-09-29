@@ -203,7 +203,14 @@ class MemoryEntryVersion(BaseModel):
 
 
 class MemoryLifecycleProjection(BaseModel):
-    """Rebuildable neutral lifecycle state for one Memory manifest entry."""
+    """Rebuildable lifecycle state for one Memory manifest entry.
+
+    Reserved infrastructure for the stage-2 quality policy. The rules are
+    deterministic so the rows can be rebuilt from the authoritative manifest, but
+    no production path consumes them yet: the materialized table has no reader
+    outside the rebuild, and the annotation below is not wired into Context Pack
+    assembly.
+    """
 
     memory_ref: ArtifactRef
     entry_id: str
@@ -217,7 +224,7 @@ class MemoryLifecycleProjection(BaseModel):
 
     @property
     def context_annotation(self) -> MemoryContextAnnotation:
-        """Return the non-public annotation available to Context Pack assembly."""
+        """Return the internal annotation reserved for Context Pack assembly."""
 
         return MemoryContextAnnotation(
             validity=self.validity,
@@ -231,7 +238,11 @@ class MemoryLifecycleProjection(BaseModel):
 
 
 class MemoryContextAnnotation(BaseModel):
-    """Internal-only lifecycle context available to later Context Pack rendering."""
+    """Internal lifecycle context reserved for later Context Pack rendering.
+
+    Nothing renders it yet, and it is deliberately absent from the public transport
+    models.
+    """
 
     validity: MemoryLifecycleValidity
     validity_reason: str | None = None

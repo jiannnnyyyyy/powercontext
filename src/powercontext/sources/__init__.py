@@ -29,6 +29,7 @@ from powercontext.sources.definitions import (
     SourceDefinition,
     SourceDefinitionRegistry,
     SourceProjection,
+    definition_memory_evidence,
 )
 from powercontext.sources.models import (
     MemoryEvidenceAuthority,
@@ -80,6 +81,7 @@ __all__ = [
     "SourceRef",
     "SourceStore",
     "TextEvidence",
+    "definition_memory_evidence",
     "manifest_for_definition",
     "project_source_for_transport",
 ]

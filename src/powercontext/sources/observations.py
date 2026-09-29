@@ -38,7 +38,11 @@ from powercontext.errors import (
     InvalidSourceProjectionError,
 )
 from powercontext.limits import MAX_SOURCE_TYPE_LENGTH
-from powercontext.sources.definitions import SourceDefinition, SourceDefinitionRegistry
+from powercontext.sources.definitions import (
+    SourceDefinition,
+    SourceDefinitionRegistry,
+    definition_memory_evidence,
+)
 from powercontext.sources.models import MemoryEvidenceDeclaration, Source, SourceMaterialization, SourceProjectionKey
 
 _JSON_VALUE = TypeAdapter(JsonValue)
@@ -117,10 +121,7 @@ class SourceDefinitionManifest(BaseModel):
             version=self.version,
             source_schema=self.source_schema,
             projections=self.projections,
-            # Accept persisted and remote manifests emitted before the evidence
-            # declaration existed. They resolve to the neutral declaration, but
-            # retain their historical content-addressed identity.
-            memory_evidence=self.memory_evidence if "memory_evidence" in self.__pydantic_fields_set__ else None,
+            memory_evidence=self.memory_evidence,
         )
         if self.fingerprint != expected:
             raise ValueError("manifest fingerprint does not match its declaration")  # noqa: TRY003
@@ -128,16 +129,16 @@ class SourceDefinitionManifest(BaseModel):
 
     @model_serializer(mode="wrap")
     def serialize_manifest(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
-        """Preserve the field set the fingerprint actually covers.
+        """Serialize the manifest in the canonical form its fingerprint covers.
 
-        A manifest received without a declaration keeps its historical identity, so
-        it must also serialize without that field. Writing the model default would
-        make the stored payload validate against a different fingerprint than the
-        one it was registered with, which makes registration unreadable.
+        A manifest whose declaration is absent or neutral carries no ranking
+        preference, so it must serialize without that field. Writing the neutral
+        default would make the stored payload validate against a fingerprint that
+        excludes it, which makes registration unreadable.
         """
 
         dumped = handler(self)
-        if "memory_evidence" not in self.__pydantic_fields_set__:
+        if _declared_evidence(self.memory_evidence) is None:
             dumped.pop("memory_evidence", None)
         return dumped
 
@@ -194,6 +195,7 @@ def manifest_for_definition(definition: SourceDefinition[Any, Any, Any], /) -> S
     """Build the immutable declaration transported by a remote worker."""
 
     source_schema = _json_object(definition.source_class.model_json_schema())
+    declared = definition_memory_evidence(definition)
     projections = tuple(
         SourceProjectionManifest(
             key=SourceProjectionKey(name=projection.name, version=projection.version),
@@ -209,11 +211,11 @@ def manifest_for_definition(definition: SourceDefinition[Any, Any, Any], /) -> S
             version=definition.version,
             source_schema=source_schema,
             projections=projections,
-            memory_evidence=definition.memory_evidence,
+            memory_evidence=declared,
         ),
         source_schema=source_schema,
         projections=projections,
-        memory_evidence=definition.memory_evidence,
+        memory_evidence=declared,
     )
 
 
@@ -248,6 +250,26 @@ def project_source_for_transport(
     )
 
 
+def _declared_evidence(
+    memory_evidence: MemoryEvidenceDeclaration | None,
+) -> dict[str, JsonValue] | None:
+    """Return the evidence fields a fingerprint covers, or ``None`` when neutral.
+
+    The neutral declaration is Definition-owned metadata that carries no ranking
+    preference, so it must not contribute to a Definition's content-addressed
+    identity. Folding it in would change the fingerprint of every Definition that
+    already registered one, and the immutable ``(name, version)`` registration
+    would then reject the re-registration every remote worker performs on each
+    run. A declaration that actually asserts an authority or verification level
+    still changes the fingerprint, because it does change what the Definition
+    attests.
+    """
+
+    if memory_evidence is None or memory_evidence == MemoryEvidenceDeclaration():
+        return None
+    return {"memory_evidence": memory_evidence.model_dump(mode="json")}
+
+
 def _source_definition_fingerprint(
     *,
     name: str,
@@ -261,7 +283,7 @@ def _source_definition_fingerprint(
         "version": version,
         "source_schema": source_schema,
         "projections": [projection.model_dump(mode="json", by_alias=True) for projection in projections],
-        **({} if memory_evidence is None else {"memory_evidence": memory_evidence.model_dump(mode="json")}),
+        **(_declared_evidence(memory_evidence) or {}),
     }
     encoded = rfc8785.dumps(_JSON_VALUE.validate_python(declaration))
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"

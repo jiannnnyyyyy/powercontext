@@ -16,10 +16,10 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal, TypeVar, cast
 
 from pydantic import RootModel
 from sqlalchemy import delete, insert, select, tuple_
@@ -89,9 +89,37 @@ class _ArtifactRefs(RootModel[tuple[ArtifactRef, ...]]):
     pass
 
 
-# An evidence lookup binds three identity columns per entry plus the scope, so it
-# chunks at the shared bind budget instead of the shared selection row count.
-_EVIDENCE_SELECTION_BATCH_SIZE = max(1, SELECTION_BATCH_SIZE // 3)
+# The evidence lookup binds three identity columns per entry, so its rows chunk at
+# the scope's share of the shared bind budget. The single-column entry-version
+# lookups bind one value per row and chunk at the row budget less the fixed
+# parameters that accompany the batch: the scope, the artifact identity, and the
+# correlated tag predicate, which binds about two values per requested label.
+# ``TagFilter`` admits at most 16 labels, so the reserve covers that maximum with
+# headroom instead of landing exactly on the budget.
+_EVIDENCE_BIND_RESERVE = 1
+_ENTRY_BIND_RESERVE = 40
+_ENTRY_SELECTION_BATCH_SIZE = max(1, SELECTION_BATCH_SIZE - _ENTRY_BIND_RESERVE)
+_EVIDENCE_SELECTION_BATCH_SIZE = max(1, (SELECTION_BATCH_SIZE - _EVIDENCE_BIND_RESERVE) // 3)
+
+_BatchItem = TypeVar("_BatchItem")
+
+
+def _batched(items: Iterable[_BatchItem], size: int, /) -> Iterator[tuple[_BatchItem, ...]]:
+    """Yield disjoint chunks of at most ``size`` items.
+
+    One statement may bind only a bounded number of values, so a lookup over an
+    unbounded manifest has to be chunked. Sharing this helper keeps every lookup
+    on the same budget instead of letting them drift apart.
+    """
+
+    batch: list[_BatchItem] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield tuple(batch)
+            batch = []
+    if batch:
+        yield tuple(batch)
 
 
 class _MemoryDraft(ArtifactDraft[MemoryContent]):
@@ -178,23 +206,26 @@ class RelationalMemoryBackend:
         canonical = await self.get(memory)
         versions = tuple(entry.entry_version_id for entry in canonical.content.manifest.entries)
         table = MEMORY_ENTRY_VERSIONS_TABLE
+        tagged: set[str] = set()
         async with self._database.connection(self._bound_connection) as connection:
-            rows = await connection.scalars(
-                select(table.c.entry_id).where(
-                    table.c.scope_id == self._scope_id,
-                    table.c.memory_artifact_id == memory.artifact_id,
-                    table.c.entry_version_id.in_(versions),
-                    tag_predicate(
-                        self._scope_id,
-                        "memory",
-                        table.c.memory_artifact_id,
-                        "memory_entry",
-                        table.c.entry_id,
-                        tag_filter,
-                    ),
+            for batch in _batched(dict.fromkeys(versions), _ENTRY_SELECTION_BATCH_SIZE):
+                rows = await connection.scalars(
+                    select(table.c.entry_id).where(
+                        table.c.scope_id == self._scope_id,
+                        table.c.memory_artifact_id == memory.artifact_id,
+                        table.c.entry_version_id.in_(batch),
+                        tag_predicate(
+                            self._scope_id,
+                            "memory",
+                            table.c.memory_artifact_id,
+                            "memory_entry",
+                            table.c.entry_id,
+                            tag_filter,
+                        ),
+                    )
                 )
-            )
-            return frozenset(rows)
+                tagged.update(rows)
+        return frozenset(tagged)
 
     async def any_tagged_entry_ids(self, memory: ArtifactRef, /) -> frozenset[str]:
         await self.get(memory)
@@ -219,20 +250,7 @@ class RelationalMemoryBackend:
         if not version_ids:
             return ()
         async with self._database.connection(self._bound_connection) as connection:
-            rows = (
-                await connection.execute(
-                    select(MEMORY_ENTRY_VERSIONS_TABLE).where(
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.scope_id == self._scope_id,
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.memory_artifact_id == memory.artifact_id,
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.entry_version_id.in_(version_ids),
-                    )
-                )
-            ).mappings()
-            versions = await self._hydrate_source_evidence(connection, tuple(_decode_entry(row) for row in rows))
-            by_id = {version.entry_version_id: version for version in versions}
-        if set(by_id) != set(version_ids):
-            raise InvalidMemoryCitationError("missing-version")
-        return tuple(by_id[version_id] for version_id in version_ids)
+            return await self._hydrate_entry_versions(connection, memory, version_ids)
 
     async def lifecycle_projections(self, memory: ArtifactRef, /) -> tuple[MemoryLifecycleProjection, ...]:
         """Load the internal neutral lifecycle projection for one exact Memory head.
@@ -247,16 +265,7 @@ class RelationalMemoryBackend:
         if not version_ids:
             return ()
         async with self._database.connection(self._bound_connection) as connection:
-            entry_rows = (
-                await connection.execute(
-                    select(MEMORY_ENTRY_VERSIONS_TABLE).where(
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.scope_id == self._scope_id,
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.memory_artifact_id == memory.artifact_id,
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.entry_version_id.in_(version_ids),
-                    )
-                )
-            ).mappings()
-            versions = await self._hydrate_source_evidence(connection, tuple(_decode_entry(row) for row in entry_rows))
+            versions = await self._hydrate_entry_versions(connection, memory, version_ids)
             by_version = {entry.entry_version_id: entry for entry in versions}
             rows = (
                 await connection.execute(
@@ -454,6 +463,42 @@ class RelationalMemoryBackend:
                 expanded.append(_decode_entry(row))
             return await self._hydrate_source_evidence(connection, tuple(expanded))
 
+    async def _hydrate_entry_versions(
+        self,
+        connection: AsyncConnection,
+        memory_ref: ArtifactRef,
+        version_ids: tuple[str, ...],
+    ) -> tuple[MemoryEntryVersion, ...]:
+        """Load the named entry versions in request order with their evidence.
+
+        A manifest may name more entries than one statement can bind, so the lookup
+        chunks at the shared budget. Every caller needs the same completeness
+        guarantee, so it lives here rather than being restated at each call site.
+        """
+
+        if not version_ids:
+            return ()
+        by_version: dict[str, MemoryEntryVersion] = {}
+        for batch in _batched(dict.fromkeys(version_ids), _ENTRY_SELECTION_BATCH_SIZE):
+            rows = (
+                await connection.execute(
+                    select(MEMORY_ENTRY_VERSIONS_TABLE).where(
+                        MEMORY_ENTRY_VERSIONS_TABLE.c.scope_id == self._scope_id,
+                        MEMORY_ENTRY_VERSIONS_TABLE.c.memory_artifact_id == memory_ref.artifact_id,
+                        MEMORY_ENTRY_VERSIONS_TABLE.c.entry_version_id.in_(batch),
+                    )
+                )
+            ).mappings()
+            hydrated = await self._hydrate_source_evidence(connection, tuple(_decode_entry(row) for row in rows))
+            by_version.update({entry.entry_version_id: entry for entry in hydrated})
+        entries: list[MemoryEntryVersion] = []
+        for version_id in version_ids:
+            entry = by_version.get(version_id)
+            if entry is None:
+                raise InvalidMemoryCitationError("missing-version")
+            entries.append(entry)
+        return tuple(entries)
+
     async def _hydrate_source_evidence(
         self,
         connection: AsyncConnection,
@@ -461,12 +506,11 @@ class RelationalMemoryBackend:
     ) -> tuple[MemoryEntryVersion, ...]:
         if not entries:
             return ()
-        identities = tuple(
-            dict.fromkeys((entry.memory_artifact_id, entry.entry_id, entry.entry_version_id) for entry in entries)
+        identities = dict.fromkeys(
+            (entry.memory_artifact_id, entry.entry_id, entry.entry_version_id) for entry in entries
         )
         snapshots: dict[tuple[str, str, str], list[MemoryEvidenceSnapshot]] = {}
-        for start in range(0, len(identities), _EVIDENCE_SELECTION_BATCH_SIZE):
-            batch = identities[start : start + _EVIDENCE_SELECTION_BATCH_SIZE]
+        for batch in _batched(identities, _EVIDENCE_SELECTION_BATCH_SIZE):
             rows = (
                 await connection.execute(
                     select(MEMORY_ENTRY_EVIDENCE_TABLE)
@@ -533,16 +577,7 @@ class RelationalMemoryBackend:
         if not manifest:
             return ()
         version_ids = tuple(item.entry_version_id for item in manifest)
-        rows = (
-            await connection.execute(
-                select(MEMORY_ENTRY_VERSIONS_TABLE).where(
-                    MEMORY_ENTRY_VERSIONS_TABLE.c.scope_id == self._scope_id,
-                    MEMORY_ENTRY_VERSIONS_TABLE.c.memory_artifact_id == memory.artifact_id,
-                    MEMORY_ENTRY_VERSIONS_TABLE.c.entry_version_id.in_(version_ids),
-                )
-            )
-        ).mappings()
-        versions = await self._hydrate_source_evidence(connection, tuple(_decode_entry(row) for row in rows))
+        versions = await self._hydrate_entry_versions(connection, memory.as_ref(), version_ids)
         by_version = {entry.entry_version_id: entry for entry in versions}
         lifecycle: list[MemoryLifecycleProjection] = []
         for item in manifest:
@@ -584,16 +619,7 @@ class RelationalMemoryBackend:
                 snapshots.append(_RebuildSnapshot(memory_ref=ref, projections=(), lifecycle=lifecycle))
                 continue
             version_ids = tuple(item.entry_version_id for item in active)
-            rows = (
-                await connection.execute(
-                    select(MEMORY_ENTRY_VERSIONS_TABLE).where(
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.scope_id == self._scope_id,
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.memory_artifact_id == ref.artifact_id,
-                        MEMORY_ENTRY_VERSIONS_TABLE.c.entry_version_id.in_(version_ids),
-                    )
-                )
-            ).mappings()
-            hydrated = await self._hydrate_source_evidence(connection, tuple(_decode_entry(row) for row in rows))
+            hydrated = await self._hydrate_entry_versions(connection, ref, version_ids)
             versions = {entry.entry_version_id: entry for entry in hydrated}
             projections: list[MemoryProjection] = []
             for item in active:

@@ -173,7 +173,7 @@ class SourceDefinitionRegistry:
         if type(source) is not definition.source_class:
             raise InvalidSourceResultError(definition.name, "resolve", definition.source_class, type(source))
         self.definition_for_source(source)
-        return cast(Source, source.model_copy(update={"memory_evidence": definition.memory_evidence}))
+        return cast(Source, source.model_copy(update={"memory_evidence": definition_memory_evidence(definition)}))
 
     async def read(self, source: Source, /) -> object:
         definition = self.definition_for_source(source)
@@ -215,6 +215,18 @@ class SourceDefinitionRegistry:
         return source.memory_evidence
 
 
+def definition_memory_evidence(definition: object, /) -> MemoryEvidenceDeclaration:
+    """Return a Definition's evidence declaration, or the neutral one when absent.
+
+    Adapters built against the contract before the declaration existed do not carry
+    the attribute at all. Resolving that case here keeps every consumer of the
+    declaration on one answer instead of requiring the caller to re-check it.
+    """
+
+    declared = getattr(definition, "memory_evidence", None)
+    return declared if isinstance(declared, MemoryEvidenceDeclaration) else MemoryEvidenceDeclaration()
+
+
 def _validate_definition(definition: object) -> tuple[type[object], type[Source]]:
     definition_type = type(definition)
     input_class = getattr(definition, "input_class", None)
@@ -233,6 +245,12 @@ def _validate_definition(definition: object) -> tuple[type[object], type[Source]
     if not isinstance(projections, tuple):
         raise InvalidSourceDefinitionError(definition_type, "projections", "must be a tuple")
     memory_evidence = getattr(definition, "memory_evidence", None)
+    if memory_evidence is None:
+        # An adapter built against the contract before the declaration existed owns
+        # no evidence metadata, which is exactly the neutral declaration. Tolerating
+        # the missing attribute keeps that adapter registering, mirroring how the
+        # manifest and observation paths accept an absent declaration.
+        memory_evidence = MemoryEvidenceDeclaration()
     if not isinstance(memory_evidence, MemoryEvidenceDeclaration):
         raise InvalidSourceDefinitionError(
             definition_type,

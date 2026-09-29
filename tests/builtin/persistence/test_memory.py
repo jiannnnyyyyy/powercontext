@@ -16,26 +16,38 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+from pydantic import ValidationError
 from sqlalchemy import BigInteger, DateTime, Integer, String, delete, event, select
 from sqlalchemy.dialects import mysql
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateTable, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 
 from powercontext.builtin.artifacts.memory import MemoryEntryInput
 from powercontext.builtin.persistence.database import SELECTION_BATCH_SIZE
-from powercontext.builtin.persistence.memory import RelationalMemoryBackend
+from powercontext.builtin.persistence.memory import (
+    _ENTRY_BIND_RESERVE,
+    _ENTRY_SELECTION_BATCH_SIZE,
+    _EVIDENCE_BIND_RESERVE,
+    _EVIDENCE_SELECTION_BATCH_SIZE,
+    RelationalMemoryBackend,
+)
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.persistence.tables import (
     MEMORY_ENTRY_EVIDENCE_TABLE,
     MEMORY_ENTRY_HEADS_TABLE,
     MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE,
     MEMORY_ENTRY_VERSIONS_TABLE,
+    SOURCES_TABLE,
 )
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
 from powercontext.builtin.runtime.relational import RelationalContexts
 from powercontext.builtin.sources import ContentCapture, ContentSource
+from powercontext.builtin.tags import TagFilter
 
 _INNODB_MAX_INDEX_BYTES = 3072
 _EVIDENCE_BUDGET_ENTRIES = SELECTION_BATCH_SIZE
+_MAXIMUM_TAG_LABELS = 16
 
 
 class _UnbudgetedColumnTypeError(TypeError):
@@ -329,12 +341,14 @@ def test_lifecycle_projection_rows_are_rewritten_only_for_changed_entries() -> N
     asyncio.run(scenario())
 
 
-def test_manifest_evidence_lookups_stay_within_the_shared_bind_budget() -> None:
-    """A manifest read must batch evidence lookups instead of binding every entry.
+def test_manifest_lookups_stay_within_the_shared_bind_budget() -> None:
+    """Every manifest-sized lookup must chunk instead of binding every entry.
 
-    The ceiling that matters depends on the SQLite build (32,766 on most system
-    builds, 250,000 in CPython's bundled Windows library), so this pins the bind
-    budget the backend controls rather than one build's variable limit.
+    The ceiling on bound values depends on the SQLite build, so this pins the bind
+    budget the backend controls rather than one build's variable limit. The budget
+    is asserted as the invariant each statement has to satisfy, not as the value
+    the current constants happen to produce, so tuning a batch size cannot make
+    the check pass or fail by itself.
     """
 
     async def scenario() -> None:
@@ -351,9 +365,8 @@ def test_manifest_evidence_lookups_stay_within_the_shared_bind_budget() -> None:
             ) -> None:
                 if not statement.lstrip().upper().startswith("SELECT"):
                     return
-                if "pc_memory_entry_evidence" in statement:
-                    assert isinstance(parameters, tuple | list)
-                    bound.append(len(parameters))
+                assert isinstance(parameters, tuple | list)
+                bound.append(len(parameters))
 
             engine = contexts.database.engine.sync_engine
             event.listen(engine, "before_cursor_execute", record_statement)
@@ -373,14 +386,89 @@ def test_manifest_evidence_lookups_stay_within_the_shared_bind_budget() -> None:
                     mode="append",
                 )
                 assert appended is not None
-                assert len(await context.artifacts.memory.entries(appended)) == _EVIDENCE_BUDGET_ENTRIES + 1
+
+                expected = _EVIDENCE_BUDGET_ENTRIES + 1
+                # Every read path that resolves a manifest must stay within budget.
+                # The lifecycle projection is internal and has no service caller yet,
+                # so it is exercised on the backend that owns the lookup.
+                backend = RelationalMemoryBackend(
+                    database=contexts.database,
+                    scope_id="project",
+                    artifacts=contexts.repositories.artifacts,
+                    index=contexts.index,
+                )
+                assert len(await context.artifacts.memory.entries(appended)) == expected
+                assert len(await backend.lifecycle_projections(appended.as_ref())) == expected
+                # A tag-filtered read also binds its correlated predicate, so
+                # exercise the widest filter the contract admits.
+                widest = TagFilter(tags=tuple(f"label-{index}" for index in range(_MAXIMUM_TAG_LABELS)))
+                assert await backend.tagged_entry_ids(appended.as_ref(), widest) == frozenset()
+                assert await backend.tagged_entry_ids(appended.as_ref(), TagFilter(tags=("absent",))) == frozenset()
+                await context.artifacts.memory.rebuild_projections()
             finally:
                 event.remove(engine, "before_cursor_execute", record_statement)
 
+            # The evidence lookup binds three identity columns per entry; every
+            # other lookup binds one value per entry. Each chunk plus the statement's
+            # fixed parameters has to fit the shared budget, so assert that invariant
+            # rather than the value the current constants happen to produce.
             assert bound
-            assert max(bound) <= SELECTION_BATCH_SIZE
+            limit = max(
+                3 * _EVIDENCE_SELECTION_BATCH_SIZE + _EVIDENCE_BIND_RESERVE,
+                _ENTRY_SELECTION_BATCH_SIZE + _ENTRY_BIND_RESERVE,
+            )
+            assert limit <= SELECTION_BATCH_SIZE
+            assert max(bound) <= limit
 
     asyncio.run(scenario())
+
+
+def test_registered_source_cannot_be_deleted_while_memory_evidence_cites_it() -> None:
+    """The evidence foreign key protects a cited Source from removal.
+
+    Any future retention or erasure implementation has to remove the citing
+    evidence rows first, so the constraint is pinned here rather than left implicit.
+    """
+
+    async def scenario() -> None:
+        async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:
+            context = await contexts.get("project")
+            source, _ = await context.sources.capture(
+                ContentCapture(source_id="turn-1", content="A cited Source cannot simply vanish.")
+            )
+            opened = await context.artifacts.memory.remember(
+                memory=None,
+                sources=(source,),
+                entries=(MemoryEntryInput(kind="fact", text="Cite the Source.", sources=(source,)),),
+                mode="append",
+            )
+            assert opened is not None
+
+            async with contexts.database.transaction() as connection:
+                with pytest.raises(IntegrityError):
+                    await connection.execute(
+                        delete(SOURCES_TABLE).where(
+                            SOURCES_TABLE.c.scope_id == "project",
+                            SOURCES_TABLE.c.source_id == "turn-1",
+                        )
+                    )
+
+    asyncio.run(scenario())
+
+
+def test_tag_filter_label_ceiling_matches_the_entry_bind_reserve() -> None:
+    """The entry bind reserve is sized for the widest tag filter the contract admits.
+
+    A tag-filtered entry lookup binds its correlated predicate on top of the batch,
+    so the reserve has to cover the maximum label count. If that ceiling ever rises,
+    the reserve has to rise with it, and this pins the pair together.
+    """
+
+    accepted = TagFilter(tags=tuple(f"label-{index}" for index in range(_MAXIMUM_TAG_LABELS)))
+    assert len(accepted.keys) == _MAXIMUM_TAG_LABELS
+    with pytest.raises(ValidationError, match="invalid number of labels"):
+        TagFilter(tags=tuple(f"label-{index}" for index in range(_MAXIMUM_TAG_LABELS + 1)))
+    assert _ENTRY_BIND_RESERVE >= 2 * _MAXIMUM_TAG_LABELS + 2
 
 
 def test_scope_bound_contexts_do_not_share_rows() -> None:
