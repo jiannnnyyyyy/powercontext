@@ -203,6 +203,10 @@ def manifest_for_definition(definition: SourceDefinition[Any, Any, Any], /) -> S
         )
         for projection in definition.projections
     )
+    # A neutral declaration is carried by omission, never as an explicit field. The
+    # fingerprint excludes it, so setting it would make this manifest serialize
+    # differently from the same manifest decoded from its stored form, and the
+    # round trip a remote worker checks would no longer agree.
     return SourceDefinitionManifest(
         name=definition.name,
         version=definition.version,
@@ -215,7 +219,7 @@ def manifest_for_definition(definition: SourceDefinition[Any, Any, Any], /) -> S
         ),
         source_schema=source_schema,
         projections=projections,
-        memory_evidence=declared,
+        **({} if _declared_evidence(declared) is None else {"memory_evidence": declared}),
     )
 
 

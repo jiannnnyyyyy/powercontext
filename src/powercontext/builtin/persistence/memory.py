@@ -723,9 +723,7 @@ class RelationalMemoryBackend:
                 insert(MEMORY_ENTRY_VERSIONS_TABLE),
                 [_entry_values(self._scope_id, entry) for entry in value.entry_versions],
             )
-            evidence_rows = [row for entry in value.entry_versions for row in _evidence_values(self._scope_id, entry)]
-            if evidence_rows:
-                await connection.execute(insert(MEMORY_ENTRY_EVIDENCE_TABLE), evidence_rows)
+            await _insert_source_evidence(connection, self._scope_id, value.entry_versions)
         # Only entries whose pointer or state changed need projection work; the
         # rest of the active head stays exactly as the previous revision left it.
         previous_active = (
@@ -776,41 +774,7 @@ class RelationalMemoryBackend:
                 value.memory.as_ref(),
                 upserts,
             )
-        # Lifecycle rows cover every manifest entry, including inactive ones, and
-        # follow the same per-entry rule as the active head: only the entries whose
-        # identity or state changed are rewritten, so repeated appends stay bounded
-        # by the appended entries instead of the manifest size.
-        previous_entries = (
-            {}
-            if value.base is None
-            else {item.entry_id: (item.entry_version_id, item.state) for item in value.base.content.manifest.entries}
-        )
-        current_entries = {
-            item.entry_id: (item.entry_version_id, item.state) for item in value.memory.content.manifest.entries
-        }
-        lifecycle_removed = tuple(sorted(entry_id for entry_id in previous_entries if entry_id not in current_entries))
-        lifecycle_changed = tuple(
-            sorted(
-                entry_id for entry_id, identity in current_entries.items() if previous_entries.get(entry_id) != identity
-            )
-        )
-        lifecycle_drop = tuple(sorted({*lifecycle_removed, *lifecycle_changed}))
-        if lifecycle_drop:
-            await connection.execute(
-                delete(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE).where(
-                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.scope_id == self._scope_id,
-                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.memory_artifact_id == value.memory.artifact_id,
-                    MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.entry_id.in_(lifecycle_drop),
-                )
-            )
-        if lifecycle_changed:
-            lifecycle = await self._lifecycle_for_entries(connection, committed, lifecycle_changed)
-            if len(lifecycle) != len(lifecycle_changed):
-                raise _InvalidMemoryCommitError("lifecycle-projection")
-            await connection.execute(
-                insert(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE),
-                [_lifecycle_values(self._scope_id, projection) for projection in lifecycle],
-            )
+        await _refresh_lifecycle_projections(connection, self, value, committed)
         return committed
 
 
@@ -876,6 +840,65 @@ def _entry_values(scope_id: str, value: MemoryEntryVersion) -> dict[str, object]
         "entry_content_hash": value.entry_content_hash,
         "created_in_revision": value.created_in_revision,
     }
+
+
+async def _refresh_lifecycle_projections(
+    connection: AsyncConnection,
+    backend: RelationalMemoryBackend,
+    value: MemoryCommit,
+    committed: Memory,
+) -> None:
+    """Rewrite the lifecycle rows whose entry identity or state changed.
+
+    Lifecycle rows cover every manifest entry, including inactive ones, and follow
+    the same per-entry rule as the active head: only changed entries are rewritten,
+    so repeated appends stay bounded by the appended entries rather than the
+    manifest size.
+    """
+
+    previous_entries = (
+        {}
+        if value.base is None
+        else {item.entry_id: (item.entry_version_id, item.state) for item in value.base.content.manifest.entries}
+    )
+    current_entries = {
+        item.entry_id: (item.entry_version_id, item.state) for item in value.memory.content.manifest.entries
+    }
+    removed = tuple(sorted(entry_id for entry_id in previous_entries if entry_id not in current_entries))
+    changed = tuple(
+        sorted(entry_id for entry_id, identity in current_entries.items() if previous_entries.get(entry_id) != identity)
+    )
+    drop = tuple(sorted({*removed, *changed}))
+    if drop:
+        await connection.execute(
+            delete(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE).where(
+                MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.scope_id == backend._scope_id,
+                MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.memory_artifact_id == value.memory.artifact_id,
+                MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.entry_id.in_(drop),
+            )
+        )
+    if changed:
+        lifecycle = await backend._lifecycle_for_entries(connection, committed, changed)
+        if len(lifecycle) != len(changed):
+            raise _InvalidMemoryCommitError("lifecycle-projection")
+        await connection.execute(
+            insert(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE),
+            [_lifecycle_values(backend._scope_id, projection) for projection in lifecycle],
+        )
+
+
+async def _insert_source_evidence(
+    connection: AsyncConnection,
+    scope_id: str,
+    entry_versions: tuple[MemoryEntryVersion, ...],
+) -> None:
+    """Write the evidence rows for one batch of entry versions, if any carry sources."""
+
+    rows: list[dict[str, object]] = []
+    for entry in entry_versions:
+        rows.extend(_evidence_values(scope_id, entry))
+    if rows:
+        await connection.execute(insert(MEMORY_ENTRY_EVIDENCE_TABLE), rows)
 
 
 def _evidence_values(scope_id: str, value: MemoryEntryVersion) -> tuple[dict[str, object], ...]:
