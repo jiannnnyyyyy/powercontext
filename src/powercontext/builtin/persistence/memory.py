@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Literal, TypeVar, cast
+from typing import Any, ClassVar, TypeVar
 
 from pydantic import RootModel
 from sqlalchemy import delete, insert, select, tuple_
@@ -37,7 +37,6 @@ from powercontext.builtin.artifacts.memory import (
     MemoryEvidenceSnapshot,
     MemoryHit,
     MemoryLifecycleProjection,
-    MemoryLifecycleValidity,
     MemoryProjection,
     MemoryRevisionChanges,
     MemorySearchChannels,
@@ -1004,62 +1003,23 @@ def _lifecycle_projection(
     *,
     row: Mapping[Any, Any] | None = None,
 ) -> MemoryLifecycleProjection:
-    """Derive one lifecycle projection, optionally carrying a persisted row's metadata.
+    """Derive one lifecycle projection for a requested revision's entry.
 
-    ``validity``, ``entry_id`` and ``entry_version_id`` always come from the entry,
-    because the manifest of the requested revision owns them. A persisted row only
-    contributes the fields the manifest does not carry, and is rejected when it
-    disagrees about the source count it was written with.
+    Every field comes from the entry the requested manifest names. A persisted row
+    is only a cross-check that the entry has one, because its columns describe the
+    revision that last wrote it: reusing them would report a later revision's state
+    under a historical reference, which the entry identity alone does not prevent.
     """
 
-    validity: MemoryLifecycleValidity = "current" if state == "active" else "inactive"
-    validity_reason: str | None = None
-    successor_entry_id: str | None = None
-    rule_version = "memory-lifecycle-v1"
-    quality_policy: Literal["neutral"] = "neutral"
-    if row is not None:
-        if str(row["entry_id"]) != entry.entry_id:
-            raise InvalidMemoryCitationError("lifecycle-version")
-        if int(row["source_count"]) != len(entry.source_evidence):
-            raise InvalidMemoryCitationError("lifecycle-source-count")
-        validity_reason = None if row["validity_reason"] is None else str(row["validity_reason"])
-        successor_entry_id = None if row["successor_entry_id"] is None else str(row["successor_entry_id"])
-        rule_version = str(row["rule_version"])
-        quality_policy = cast(Literal["neutral"], str(row["quality_policy"]))
+    if row is not None and str(row["entry_id"]) != entry.entry_id:
+        raise InvalidMemoryCitationError("lifecycle-version")
     return MemoryLifecycleProjection(
         memory_ref=memory_ref,
         entry_id=entry.entry_id,
         entry_version_id=entry.entry_version_id,
-        validity=validity,
-        validity_reason=validity_reason,
-        successor_entry_id=successor_entry_id,
+        validity="current" if state == "active" else "inactive",
         source_evidence=entry.source_evidence,
-        rule_version=rule_version,
-        quality_policy=quality_policy,
     )
-
-
-def _decode_lifecycle_projection(
-    memory_ref: ArtifactRef,
-    row: Mapping[Any, Any],
-    entry: MemoryEntryVersion | None,
-) -> MemoryLifecycleProjection:
-    if entry is None or entry.entry_id != str(row["entry_id"]):
-        raise InvalidMemoryCitationError("lifecycle-version")
-    projection = MemoryLifecycleProjection(
-        memory_ref=memory_ref,
-        entry_id=str(row["entry_id"]),
-        entry_version_id=str(row["entry_version_id"]),
-        validity=cast(MemoryLifecycleValidity, str(row["validity"])),
-        validity_reason=(None if row["validity_reason"] is None else str(row["validity_reason"])),
-        successor_entry_id=(None if row["successor_entry_id"] is None else str(row["successor_entry_id"])),
-        source_evidence=entry.source_evidence,
-        rule_version=str(row["rule_version"]),
-        quality_policy=cast(Literal["neutral"], str(row["quality_policy"])),
-    )
-    if int(row["source_count"]) != len(projection.source_evidence):
-        raise InvalidMemoryCitationError("lifecycle-source-count")
-    return projection
 
 
 def _validate_rebuild_entry(

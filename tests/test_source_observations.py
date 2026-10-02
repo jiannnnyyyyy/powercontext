@@ -23,7 +23,7 @@ from typing import Any, cast
 
 import pytest
 import rfc8785
-from pydantic import ValidationError
+from pydantic import ConfigDict, ValidationError
 from referencing.exceptions import Unresolvable
 
 from powercontext.builtin.runtime.relational import _json_schema_validator, _validate_source_observation
@@ -50,6 +50,7 @@ from powercontext.sources import (
     manifest_for_definition,
     project_source_for_transport,
 )
+from powercontext.sources.definitions import AdapterSourceDefinition
 
 
 class EmptySourceBackend:
@@ -107,6 +108,55 @@ def test_version_parts_are_rejected_before_they_cannot_be_transported() -> None:
     assert len(accepted.declaration_version) == MAX_VERSION_LENGTH
     with pytest.raises(ValueError, match="declaration_version"):
         MemoryEvidenceDeclaration(declaration_version="v" * (MAX_VERSION_LENGTH + 1))
+
+
+def _strict_content_definition() -> AdapterSourceDefinition[ContentCapture, ContentSource, str]:
+    """Return a Definition whose Source class rejects properties it does not declare."""
+
+    class StrictContentSource(ContentSource):
+        model_config = ConfigDict(extra="forbid")
+
+    class StrictContentAdapter:
+        name = "strict-content"
+        input_class = ContentCapture
+        source_class: type[ContentSource] = StrictContentSource
+
+        async def resolve(self, value: ContentCapture, /) -> ContentSource:
+            return StrictContentSource(
+                name=value.source_id,
+                materialization=SourceMaterialization.CAPTURED,
+                content=value.content,
+            )
+
+        async def read(self, source: ContentSource, /) -> str:
+            return source.content
+
+    return AdapterSourceDefinition(StrictContentAdapter())
+
+
+def test_generated_payload_satisfies_its_contract_and_excludes_declaration_metadata() -> None:
+    """A generated payload must satisfy the schema its manifest advertises.
+
+    The declaration is Definition-owned metadata, so a Source class that forbids
+    extra properties would reject its own generated observation, and an unchanged
+    Source would carry a different payload after the field was introduced, which
+    breaks replaying an observation captured before the upgrade.
+    """
+
+    async def scenario() -> None:
+        definition = _strict_content_definition()
+        registry = SourceDefinitionRegistry((definition,))
+        manifest = manifest_for_definition(definition)
+        source = await registry.resolve(ContentCapture(source_id="turn-1", content="Captured body."))
+        observation = project_source_for_transport(registry, source)
+
+        assert "memory_evidence" not in observation.payload
+        properties = cast("dict[str, object]", manifest.source_schema["properties"])
+        assert "memory_evidence" not in properties
+        # The payload the worker generates must pass the contract it advertises.
+        _json_schema_validator(manifest.name, manifest.source_schema).validate(observation.payload)
+
+    asyncio.run(scenario())
 
 
 def test_definition_without_a_declaration_attribute_still_registers() -> None:

@@ -513,6 +513,59 @@ def test_lifecycle_reads_report_the_state_of_the_requested_revision() -> None:
     asyncio.run(scenario())
 
 
+def test_lifecycle_reads_follow_the_evidence_of_the_requested_revision() -> None:
+    """A lifecycle read must not borrow a persisted row's evidence count.
+
+    Revising an entry to cite a Source keeps its row but changes what the row
+    describes. A historical reference has to report the evidence that revision
+    actually carried rather than the latest row's count.
+    """
+
+    async def scenario() -> None:
+        async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:
+            context = await contexts.get("project")
+            source, _ = await context.sources.capture(
+                ContentCapture(source_id="turn-1", content="Evidence added by a later revision.")
+            )
+            opened = await context.artifacts.memory.remember(
+                memory=None,
+                entries=(MemoryEntryInput(kind="fact", text="Evidence arrives later."),),
+                mode="append",
+            )
+            assert opened is not None
+            entry = (await context.artifacts.memory.entries(opened))[0]
+            assert entry.sources == ()
+            revised = await context.artifacts.memory.remember(
+                memory=opened,
+                sources=(source,),
+                entries=(
+                    MemoryEntryInput(
+                        kind="fact",
+                        text="Evidence arrives later.",
+                        entry=entry,
+                        sources=(source,),
+                    ),
+                ),
+                mode="append",
+            )
+            assert revised is not None
+
+            backend = RelationalMemoryBackend(
+                database=contexts.database,
+                scope_id="project",
+                artifacts=contexts.repositories.artifacts,
+                index=contexts.index,
+            )
+            for revision, expected in ((opened.revision, 0), (revised.revision, 1)):
+                reference = revised.as_ref().model_copy(update={"revision": revision})
+                (projection,) = await backend.lifecycle_projections(reference)
+                assert len(projection.source_evidence) == expected, (
+                    f"revision {revision} reported {len(projection.source_evidence)} evidence entries"
+                )
+
+    asyncio.run(scenario())
+
+
 def test_scope_bound_contexts_do_not_share_rows() -> None:
     async def scenario() -> None:
         async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:

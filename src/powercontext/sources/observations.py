@@ -45,7 +45,13 @@ from powercontext.sources.definitions import (
     SourceDefinitionRegistry,
     definition_memory_evidence,
 )
-from powercontext.sources.models import MemoryEvidenceDeclaration, Source, SourceMaterialization, SourceProjectionKey
+from powercontext.sources.models import (
+    DECLARATION_OWNED_FIELDS,
+    MemoryEvidenceDeclaration,
+    Source,
+    SourceMaterialization,
+    SourceProjectionKey,
+)
 
 _JSON_VALUE = TypeAdapter(JsonValue)
 _JSON_SCHEMA_REFERENCE = re.compile(r"#/\$defs/([^\"\\]+)")
@@ -207,14 +213,33 @@ def _input_contract_schema(source_class: type[Source]) -> dict[str, JsonValue]:
     """
 
     schema = _json_object(source_class.model_json_schema())
-    properties = schema.get("properties")
-    if isinstance(properties, dict):
-        properties.pop("memory_evidence", None)
-    required = schema.get("required")
-    if isinstance(required, list):
-        schema["required"] = [field for field in required if field != "memory_evidence"]
+    _remove_declaration_owned_fields(schema)
     _drop_unreferenced_definitions(schema)
     return schema
+
+
+def _remove_declaration_owned_fields(node: JsonValue) -> None:
+    """Strip Definition-owned fields from every object definition in a schema.
+
+    A recursive or nested Source does not list its inherited fields at the root:
+    Pydantic emits the type under ``$defs`` and points at it with a local
+    reference. Every such definition carries the declaration, so the walk has to
+    cover the whole document rather than the root ``properties``.
+    """
+
+    if isinstance(node, dict):
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            for field in DECLARATION_OWNED_FIELDS:
+                properties.pop(field, None)
+        required = node.get("required")
+        if isinstance(required, list):
+            node["required"] = [field for field in required if field not in DECLARATION_OWNED_FIELDS]
+        for value in node.values():
+            _remove_declaration_owned_fields(value)
+    elif isinstance(node, list):
+        for item in node:
+            _remove_declaration_owned_fields(item)
 
 
 def _drop_unreferenced_definitions(schema: dict[str, JsonValue]) -> None:
@@ -282,7 +307,13 @@ def project_source_for_transport(
             "remote Source observations must retain their canonical value",
         )
     manifest = manifest_for_definition(definition)
-    payload = _json_object(source.model_dump(mode="json"))
+    # The captured payload has to satisfy the contract the manifest advertises, and
+    # Definition-owned metadata is not part of it. Carrying it here would make a
+    # generated observation fail its own schema, and would change the payload of an
+    # unchanged Source, so replaying a pre-upgrade observation would conflict.
+    payload = _json_object({
+        key: value for key, value in source.model_dump(mode="json").items() if key not in DECLARATION_OWNED_FIELDS
+    })
     projections = tuple(
         SourceProjectionValue(key=key, value=registry.project(source, key)) for key in registry.projection_keys(source)
     )

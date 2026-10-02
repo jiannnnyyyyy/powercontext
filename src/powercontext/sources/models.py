@@ -95,6 +95,13 @@ class SourceProjectionKey(BaseModel):
         return value
 
 
+# Fields a Source carries for its Definition's benefit rather than as captured content.
+# They are stamped from the Definition, so they belong to the observation envelope
+# and the manifest, and must stay out of both the payload a worker generates and the
+# input contract that payload is validated against.
+DECLARATION_OWNED_FIELDS = frozenset({"memory_evidence"})
+
+
 class Source(BaseModel):
     """Base value for an adapter-owned Source description."""
 
