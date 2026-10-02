@@ -23,7 +23,7 @@ from typing import Any, cast
 
 import pytest
 import rfc8785
-from pydantic import ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 from referencing.exceptions import Unresolvable
 
 from powercontext.builtin.runtime.relational import _json_schema_validator, _validate_source_observation
@@ -157,6 +157,56 @@ def test_generated_payload_satisfies_its_contract_and_excludes_declaration_metad
         _json_schema_validator(manifest.name, manifest.source_schema).validate(observation.payload)
 
     asyncio.run(scenario())
+
+
+def test_captured_models_keep_a_field_that_shares_the_declaration_name() -> None:
+    """Only the declaration a Source inherits is metadata; a captured field is content.
+
+    A captured model may legitimately declare a field of its own called
+    ``memory_evidence``. Dropping it would change that model's contract, so the
+    removal identifies the inherited declaration by what it is, not by its name.
+    """
+
+    class CapturedReport(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        memory_evidence: str
+        summary: str
+
+    class ReportingSource(ContentSource):
+        report: CapturedReport
+
+    class ReportingAdapter:
+        name = "reporting-content"
+        input_class = ContentCapture
+        source_class: type[ContentSource] = ReportingSource
+
+        async def resolve(self, value: ContentCapture, /) -> ContentSource:
+            return ReportingSource(
+                name=value.source_id,
+                materialization=SourceMaterialization.CAPTURED,
+                content=value.content,
+                report=CapturedReport(memory_evidence="captured detail", summary="summary"),
+            )
+
+        async def read(self, source: ContentSource, /) -> str:
+            return source.content
+
+    definition = AdapterSourceDefinition(ReportingAdapter())
+    registry = SourceDefinitionRegistry((definition,))
+    manifest = manifest_for_definition(definition)
+
+    definitions = cast("dict[str, dict[str, object]]", manifest.source_schema["$defs"])
+    captured = cast("dict[str, object]", definitions["CapturedReport"]["properties"])
+    assert "memory_evidence" in captured
+    root = cast("dict[str, object]", manifest.source_schema["properties"])
+    assert "memory_evidence" not in root
+
+    source = asyncio.run(registry.resolve(ContentCapture(source_id="turn-1", content="Captured body.")))
+    observation = project_source_for_transport(registry, source)
+    report = cast("dict[str, object]", observation.payload["report"])
+    assert report["memory_evidence"] == "captured detail"
+    _json_schema_validator(manifest.name, manifest.source_schema).validate(observation.payload)
 
 
 def test_definition_without_a_declaration_attribute_still_registers() -> None:

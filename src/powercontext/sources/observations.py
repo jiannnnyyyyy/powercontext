@@ -213,33 +213,39 @@ def _input_contract_schema(source_class: type[Source]) -> dict[str, JsonValue]:
     """
 
     schema = _json_object(source_class.model_json_schema())
-    _remove_declaration_owned_fields(schema)
+    _remove_inherited_declaration(schema, _declaration_signature())
     _drop_unreferenced_definitions(schema)
     return schema
 
 
-def _remove_declaration_owned_fields(node: JsonValue) -> None:
-    """Strip Definition-owned fields from every object definition in a schema.
+def _declaration_signature() -> JsonValue:
+    """Return the schema Pydantic emits for the declaration a Source inherits."""
 
-    A recursive or nested Source does not list its inherited fields at the root:
-    Pydantic emits the type under ``$defs`` and points at it with a local
-    reference. Every such definition carries the declaration, so the walk has to
-    cover the whole document rather than the root ``properties``.
+    return _json_object(Source.model_json_schema()["properties"])["memory_evidence"]
+
+
+def _remove_inherited_declaration(node: JsonValue, signature: JsonValue) -> None:
+    """Strip the inherited declaration from every object schema that carries it.
+
+    Recursive and nested Sources keep their fields in a local definition rather
+    than at the root, so the walk covers the whole document. The field is matched
+    by the schema a Source inherits rather than by its name alone, because an
+    ordinary captured model may declare a field of its own with the same name and
+    a different meaning, and that field belongs to the captured contract.
     """
 
     if isinstance(node, dict):
         properties = node.get("properties")
-        if isinstance(properties, dict):
-            for field in DECLARATION_OWNED_FIELDS:
-                properties.pop(field, None)
-        required = node.get("required")
-        if isinstance(required, list):
-            node["required"] = [field for field in required if field not in DECLARATION_OWNED_FIELDS]
+        if isinstance(properties, dict) and properties.get("memory_evidence") == signature:
+            del properties["memory_evidence"]
+            required = node.get("required")
+            if isinstance(required, list):
+                node["required"] = [field for field in required if field != "memory_evidence"]
         for value in node.values():
-            _remove_declaration_owned_fields(value)
+            _remove_inherited_declaration(value, signature)
     elif isinstance(node, list):
         for item in node:
-            _remove_declaration_owned_fields(item)
+            _remove_inherited_declaration(item, signature)
 
 
 def _drop_unreferenced_definitions(schema: dict[str, JsonValue]) -> None:
