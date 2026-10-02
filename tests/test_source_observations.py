@@ -90,7 +90,8 @@ def test_neutral_declaration_keeps_the_pre_change_definition_identity() -> None:
 
     manifest = manifest_for_definition(CONTENT_SOURCE_DEFINITION)
 
-    assert "memory_evidence" not in manifest.source_schema.get("properties", {})
+    declared_properties = cast("dict[str, object]", manifest.source_schema["properties"])
+    assert "memory_evidence" not in declared_properties
     assert manifest.fingerprint == ("sha256:0b58627bec9b987d1c3613d98c72f3131ec2a81f95cbc620ef05d923585e0935")
 
 
