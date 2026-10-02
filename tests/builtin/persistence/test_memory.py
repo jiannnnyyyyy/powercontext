@@ -471,6 +471,48 @@ def test_tag_filter_label_ceiling_matches_the_entry_bind_reserve() -> None:
     assert _ENTRY_BIND_RESERVE >= 2 * _MAXIMUM_TAG_LABELS + 2
 
 
+def test_lifecycle_reads_report_the_state_of_the_requested_revision() -> None:
+    """A lifecycle read must not answer a historical reference with a later state.
+
+    ``forget`` and ``reactivate`` keep the same entry version, so an identity-only
+    check accepts a row the requested revision never had. Deriving the state from
+    the requested manifest keeps a historical reference from reporting current
+    state.
+    """
+
+    async def scenario() -> None:
+        async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:
+            context = await contexts.get("project")
+            opened = await context.artifacts.memory.remember(
+                memory=None,
+                entries=(MemoryEntryInput(kind="fact", text="Lifecycle follows its revision."),),
+                mode="append",
+            )
+            assert opened is not None
+            entry = (await context.artifacts.memory.entries(opened))[0]
+            forgotten = await context.artifacts.memory.forget(opened, entries=(entry,), reason="forgotten")
+            assert forgotten is not None
+            restored = await context.artifacts.memory.reactivate(forgotten, entries=(entry,), reason="restored")
+            assert restored is not None
+
+            backend = RelationalMemoryBackend(
+                database=contexts.database,
+                scope_id="project",
+                artifacts=contexts.repositories.artifacts,
+                index=contexts.index,
+            )
+            for revision, expected in (
+                (opened.revision, "current"),
+                (forgotten.revision, "inactive"),
+                (restored.revision, "current"),
+            ):
+                reference = restored.as_ref().model_copy(update={"revision": revision})
+                (projection,) = await backend.lifecycle_projections(reference)
+                assert projection.validity == expected, f"revision {revision} reported {projection.validity}"
+
+    asyncio.run(scenario())
+
+
 def test_scope_bound_contexts_do_not_share_rows() -> None:
     async def scenario() -> None:
         async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:

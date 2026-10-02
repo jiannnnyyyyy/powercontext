@@ -31,6 +31,7 @@ from powercontext.builtin.sources import CONTENT_SOURCE_DEFINITION, ContentCaptu
 from powercontext.http import SourceDefinitionManifest as HttpSourceDefinitionManifest
 from powercontext.http import SourceObservation as HttpSourceObservation
 from powercontext.http import SubmitSourceObservationRequest
+from powercontext.limits import MAX_VERSION_LENGTH
 from powercontext.server.mapping import runtime_source_definition_manifest, submit_source_observation_request
 from powercontext.sources import (
     TEXT_EVIDENCE_PROJECTION_KEY,
@@ -75,6 +76,36 @@ def _legacy_manifest(current: SourceDefinitionManifest) -> SourceDefinitionManif
         projections=current.projections,
         fingerprint=f"sha256:{hashlib.sha256(rfc8785.dumps(payload)).hexdigest()}",
     )
+
+
+def test_neutral_declaration_keeps_the_pre_change_definition_identity() -> None:
+    """A Definition registered before the declaration existed must still re-register.
+
+    The declaration is inherited by every Source class, so adding it would otherwise
+    change each class's schema, and the fingerprint covers that schema. The
+    fingerprint below was computed from the same Definition on the revision before
+    the declaration was introduced, so it pins the identity an upgraded worker
+    re-registers against a manifest an older worker already registered.
+    """
+
+    manifest = manifest_for_definition(CONTENT_SOURCE_DEFINITION)
+
+    assert "memory_evidence" not in manifest.source_schema.get("properties", {})
+    assert manifest.fingerprint == ("sha256:0b58627bec9b987d1c3613d98c72f3131ec2a81f95cbc620ef05d923585e0935")
+
+
+def test_version_parts_are_rejected_before_they_cannot_be_transported() -> None:
+    """A version length must be validated where it is accepted, not on the way out.
+
+    A declaration version travels through the transport model and a bounded
+    identity column, so a longer value would register locally and then fail when
+    it is converted for transport.
+    """
+
+    accepted = MemoryEvidenceDeclaration(declaration_version="v" * MAX_VERSION_LENGTH)
+    assert len(accepted.declaration_version) == MAX_VERSION_LENGTH
+    with pytest.raises(ValueError, match="declaration_version"):
+        MemoryEvidenceDeclaration(declaration_version="v" * (MAX_VERSION_LENGTH + 1))
 
 
 def test_definition_without_a_declaration_attribute_still_registers() -> None:

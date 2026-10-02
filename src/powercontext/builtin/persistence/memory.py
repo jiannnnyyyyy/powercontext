@@ -261,7 +261,8 @@ class RelationalMemoryBackend:
         """
 
         canonical = await self.get(memory)
-        version_ids = tuple(item.entry_version_id for item in canonical.content.manifest.entries)
+        manifest = canonical.content.manifest.entries
+        version_ids = tuple(item.entry_version_id for item in manifest)
         if not version_ids:
             return ()
         async with self._database.connection(self._bound_connection) as connection:
@@ -277,12 +278,23 @@ class RelationalMemoryBackend:
                     .order_by(MEMORY_ENTRY_LIFECYCLE_PROJECTIONS_TABLE.c.entry_id)
                 )
             ).mappings()
-            projections = tuple(
-                _decode_lifecycle_projection(memory, row, by_version.get(str(row["entry_version_id"]))) for row in rows
+            by_entry = {str(row["entry_id"]): row for row in rows}
+        # The manifest owns each entry's state and version, so derive those from the
+        # requested revision. Deactivating or reactivating an entry keeps its version
+        # identity, so a row written by a later revision would otherwise pass an
+        # identity check and report that later state under a historical reference.
+        projections: list[MemoryLifecycleProjection] = []
+        for item in manifest:
+            row = by_entry.get(item.entry_id)
+            projections.append(
+                _lifecycle_projection(
+                    memory,
+                    item.state,
+                    by_version[item.entry_version_id],
+                    row=row,
+                )
             )
-        if {item.entry_id for item in projections} != {item.entry_id for item in canonical.content.manifest.entries}:
-            raise InvalidMemoryCitationError("lifecycle-projection")
-        return projections
+        return tuple(projections)
 
     async def projections(self, memory: ArtifactRef, /) -> tuple[MemoryProjection, ...]:
         canonical = await self.get(memory)
@@ -989,14 +1001,41 @@ def _lifecycle_projection(
     memory_ref: ArtifactRef,
     state: str,
     entry: MemoryEntryVersion,
+    *,
+    row: Mapping[Any, Any] | None = None,
 ) -> MemoryLifecycleProjection:
-    validity = "current" if state == "active" else "inactive"
+    """Derive one lifecycle projection, optionally carrying a persisted row's metadata.
+
+    ``validity``, ``entry_id`` and ``entry_version_id`` always come from the entry,
+    because the manifest of the requested revision owns them. A persisted row only
+    contributes the fields the manifest does not carry, and is rejected when it
+    disagrees about the source count it was written with.
+    """
+
+    validity: MemoryLifecycleValidity = "current" if state == "active" else "inactive"
+    validity_reason: str | None = None
+    successor_entry_id: str | None = None
+    rule_version = "memory-lifecycle-v1"
+    quality_policy: Literal["neutral"] = "neutral"
+    if row is not None:
+        if str(row["entry_id"]) != entry.entry_id:
+            raise InvalidMemoryCitationError("lifecycle-version")
+        if int(row["source_count"]) != len(entry.source_evidence):
+            raise InvalidMemoryCitationError("lifecycle-source-count")
+        validity_reason = None if row["validity_reason"] is None else str(row["validity_reason"])
+        successor_entry_id = None if row["successor_entry_id"] is None else str(row["successor_entry_id"])
+        rule_version = str(row["rule_version"])
+        quality_policy = cast(Literal["neutral"], str(row["quality_policy"]))
     return MemoryLifecycleProjection(
         memory_ref=memory_ref,
         entry_id=entry.entry_id,
         entry_version_id=entry.entry_version_id,
         validity=validity,
+        validity_reason=validity_reason,
+        successor_entry_id=successor_entry_id,
         source_evidence=entry.source_evidence,
+        rule_version=rule_version,
+        quality_policy=quality_policy,
     )
 
 

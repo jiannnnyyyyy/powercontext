@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from typing import Any, Literal
 
 import rfc8785
@@ -46,6 +48,7 @@ from powercontext.sources.definitions import (
 from powercontext.sources.models import MemoryEvidenceDeclaration, Source, SourceMaterialization, SourceProjectionKey
 
 _JSON_VALUE = TypeAdapter(JsonValue)
+_JSON_SCHEMA_REFERENCE = re.compile(r"#/\$defs/([^\"\\]+)")
 
 
 class SourceProjectionManifest(BaseModel):
@@ -191,10 +194,52 @@ class SourceObservation(Source):
         raise InvalidSourceProjectionError(key.name, "key", "was not supplied by the worker")
 
 
+def _input_contract_schema(source_class: type[Source]) -> dict[str, JsonValue]:
+    """Return a Source class's input contract, without Definition-owned metadata.
+
+    The declaration is stamped from the Definition rather than carried by the
+    captured value, so it is not part of what a worker's payload has to satisfy.
+    Leaving it in would change the schema of every Source class that inherits it,
+    and the manifest fingerprint covers that schema, so a Definition registered
+    before the field existed would no longer match the one a worker emits. The
+    orphaned definitions the removed property referenced are dropped with it,
+    because an unused ``$defs`` entry still changes the hashed document.
+    """
+
+    schema = _json_object(source_class.model_json_schema())
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("memory_evidence", None)
+    required = schema.get("required")
+    if isinstance(required, list):
+        schema["required"] = [field for field in required if field != "memory_evidence"]
+    _drop_unreferenced_definitions(schema)
+    return schema
+
+
+def _drop_unreferenced_definitions(schema: dict[str, JsonValue]) -> None:
+    """Remove ``$defs`` entries no longer referenced anywhere in the schema."""
+
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict):
+        return
+    while True:
+        # Reference discovery has to see the whole document: the properties that
+        # point at a definition live outside ``$defs``.
+        referenced = set(_JSON_SCHEMA_REFERENCE.findall(json.dumps(schema)))
+        unreferenced = [name for name in definitions if name not in referenced]
+        if not unreferenced:
+            break
+        for name in unreferenced:
+            del definitions[name]
+    if not definitions:
+        del schema["$defs"]
+
+
 def manifest_for_definition(definition: SourceDefinition[Any, Any, Any], /) -> SourceDefinitionManifest:
     """Build the immutable declaration transported by a remote worker."""
 
-    source_schema = _json_object(definition.source_class.model_json_schema())
+    source_schema = _input_contract_schema(definition.source_class)
     declared = definition_memory_evidence(definition)
     projections = tuple(
         SourceProjectionManifest(

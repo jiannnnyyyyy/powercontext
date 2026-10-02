@@ -19,7 +19,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from powercontext.errors import InvalidSourceReferenceError
-from powercontext.limits import MAX_SOURCE_ID_LENGTH, MAX_SOURCE_TYPE_LENGTH
+from powercontext.limits import MAX_SOURCE_ID_LENGTH, MAX_SOURCE_TYPE_LENGTH, MAX_VERSION_LENGTH
 
 
 class SourceMaterialization(StrEnum):
@@ -116,6 +116,20 @@ def _validate_reference_part(field: str, value: object) -> None:
         raise InvalidSourceReferenceError(field, "must be a non-empty string")
     if value != value.strip():
         raise InvalidSourceReferenceError(field, "must not contain leading or trailing whitespace")
-    maximum = MAX_SOURCE_TYPE_LENGTH if field == "source_type" else MAX_SOURCE_ID_LENGTH
+    maximum = _reference_part_limit(field)
     if len(value) > maximum:
         raise InvalidSourceReferenceError(field, f"must not exceed {maximum} characters")
+
+
+def _reference_part_limit(field: str) -> int:
+    """Return the length the contract allows for one reference part.
+
+    A version travels through the transport model and a bounded identity column, so
+    a value accepted here has to stay usable across both. Admitting a longer value
+    would let a Definition or Source register locally and then fail when it is
+    converted for transport.
+    """
+
+    if field in {"declaration_version", "definition_version"}:
+        return MAX_VERSION_LENGTH
+    return MAX_SOURCE_TYPE_LENGTH if field == "source_type" else MAX_SOURCE_ID_LENGTH
